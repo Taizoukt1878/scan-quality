@@ -1,30 +1,40 @@
 # Scan Quality API
 
-Scores how well a document has been scanned — cheques, certificates, devis/quotes — and returns a
-0-100 breakdown so you can reject a bad capture before it reaches OCR or a human reviewer.
+Decides whether a **photo of a document** — a cheque, an accident report, a claim form, an invoice —
+is good enough to send to extraction, and if not, tells the user what to do differently. Built for
+capture flows in insurance and banking, where a rejected photo is retaken on the spot instead of
+failing silently downstream.
 
-Everything runs locally on free, open-source software. No external APIs, no network calls, no keys.
+Everything runs locally on free, open-source software. No external APIs, no network calls, no keys,
+no OCR engine.
 
-Upload a JPEG, PNG or PDF; get back five independent check scores, their unweighted average, a
-plain-language label for each, and the total processing time.
+Upload a JPEG, PNG or PDF; get back an accept/reject decision, the instruction to show the user,
+and a per-check breakdown with the raw measurements behind each score.
+
+The formulas, their reasoning and worked examples are in **[docs/scores.md](docs/scores.md)**.
 
 ---
 
-## The five checks
+## How it works
 
-Each check is a pure function of the pixel data, normalized to 0-100 where **higher is better**.
-The overall score is their **simple unweighted average**.
+1. **Find the document.** The page is located against the surface it lies on, its four corners
+   are found, and it is warped flat onto its real physical size at 8 px/mm (~200 DPI). Rotation and
+   perspective are removed here, so they are never penalized. PDF pages skip this step.
+2. **Run five checks** on the flattened document, each normalized to 0–100 where **higher is
+   better**:
 
-| # | Check | Raw metric | Scores 0 at | Scores 100 at | Module |
-|---|-------|------------|-------------|---------------|--------|
-| 1 | **Sharpness** | Variance of the Laplacian | `15.0` | `600.0` (log ramp) | `scoring/sharpness.py` |
-| 2 | **Lighting uniformity** | Std-dev of mean brightness across an 8×8 grid | `45.0` | `4.0` | `scoring/lighting.py` |
-| 3 | **Contrast** | RMS contrast (std-dev of intensity) | `12.0` | `65.0` | `scoring/contrast.py` |
-| 4 | **Skew** | Dominant text-line angle, degrees | `5.0°` | `0.5°` | `scoring/skew.py` |
-| 5 | **OCR confidence** | Mean per-word Tesseract confidence | `40.0` | `92.0` | `scoring/ocr.py` |
+| Check | Catches | Raw metric | Scores 0 at | Scores 100 at | Module |
+|-------|---------|------------|-------------|---------------|--------|
+| **Framing** | Missing, cut-off or too-distant document | Worst-side resolution, px/mm | `4.0` (or cut off) | `8.0` | `scoring/framing.py` |
+| **Sharpness** | Hand shake, focus falloff | 10th-percentile tile ratio `Var(∇²)/Var(I)` | `0.005` | `0.10` (log ramp) | `scoring/sharpness.py` |
+| **Shadows** | Shadow of a hand or phone | Paper brightness ratio p5/p95 | `0.40` | `0.80` | `scoring/shadows.py` |
+| **Glare** | Reflections, overexposure | Largest saturated blob, % of area | `1.0 %` | `0.05 %` | `scoring/glare.py` |
+| **Contrast** | Faint ink, low-light noise | Worst-cell ink/paper gap in noise units (+ ink depth) | `2.0σ` | `6.0σ` | `scoring/contrast.py` |
 
-Checks 2 and 4 run *backwards* — less spread and less tilt are better — which is why their "0 at"
-value is the larger one.
+3. **Gate on the weakest link.** The capture is accepted only if **every** check reaches its
+   threshold (50 by default). The overall score is the **minimum** check score, and the worst
+   failing check supplies the retake message. A mean would let four good scores outvote one fatal
+   defect.
 
 ### Labels
 
@@ -35,61 +45,25 @@ The same vocabulary applies to every check and to the overall score:
 | ≥ 85 | `excellent` |
 | ≥ 70 | `good` |
 | ≥ 50 | `fair` |
-| < 50 | `poor` |
+| < 50 | `poor` → rejected |
 
-A check that could not measure anything at all reports `unknown` (see *Caveats*).
-
-### Notes on the methods
-
-**Sharpness** uses a logarithmic ramp because Laplacian variance spans orders of magnitude — the
-perceptual gap between 20 and 60 is far larger than between 500 and 540. The image is first
-resampled to a fixed working size, because the same physical blur measures much higher on a 4000px
-scan than a 1000px one.
-
-**Skew** runs the Hough Transform over *character baseline points* — each glyph reduced to one pixel
-at the centre of its bottom edge — rather than over text pixels or word blobs. This matters: any
-line running lengthwise through a blob of height `h` and length `L` collects a full set of votes, so
-every angle within `±atan(h/L)` ties. For body text that ambiguity cone exceeds a degree, which is
-larger than the whole range this check cares about. One-pixel points have no such cone, and the
-estimate lands within ~0.13° of truth. Binarization is adaptive, so skew stays measurable on pages
-that fail the blur and lighting checks.
+Sharpness reports `unknown` (a neutral 50) on a page with no text to judge focus on; the contrast
+check rejects such a page instead, with the right instruction.
 
 ---
 
 ## Prerequisites
 
-Two **system** packages are required in addition to the Python dependencies. They are not pip
-packages — `pytesseract` and `pdf2image` are thin wrappers that shell out to these binaries.
+One **system** package is needed, and only for PDF uploads. `pdf2image` is a thin wrapper that
+shells out to it.
 
 | Binary | Needed for | Without it |
 |--------|-----------|------------|
-| `tesseract` | Check 5 (OCR confidence) | `/score` returns **503** for every request |
 | `poppler` (`pdftoppm`, `pdfinfo`) | Rendering PDF uploads | PDF uploads return **503**; JPEG/PNG still work |
 
-**Ubuntu / Debian**
-
 ```bash
-sudo apt-get update
-sudo apt-get install -y tesseract-ocr poppler-utils
-
-# Optional: French language pack, for devis/quotes and certificates
-sudo apt-get install -y tesseract-ocr-fra
-```
-
-**macOS (Homebrew)**
-
-```bash
-brew install tesseract poppler
-
-# Optional: all language packs, including French
-brew install tesseract-lang
-```
-
-Verify:
-
-```bash
-tesseract --version
-pdftoppm -v
+sudo apt-get install -y poppler-utils   # Ubuntu / Debian
+brew install poppler                    # macOS
 ```
 
 ---
@@ -109,8 +83,6 @@ Interactive API docs: <http://127.0.0.1:8000/docs>
 
 ### Docker
 
-The image installs Tesseract (with the French pack) and poppler for you.
-
 ```bash
 docker build -t scan-quality .
 docker run --rm -p 8000:8000 scan-quality
@@ -126,94 +98,106 @@ docker run --rm -p 8000:8000 scan-quality
 
 | Field | In | Required | Description |
 |-------|-----|----------|-------------|
-| `file` | form-data | yes | The document. For a PDF, **only page 1 is scored**. |
-| `lang` | query | no | Tesseract language pack(s), e.g. `fra` or `fra+eng`. Default `eng`. Must be installed — the service checks up front and returns a 400 naming what is missing and what is available. |
+| `file` | form-data | yes | The capture. For a PDF, **only page 1 is scored**, as the whole document. |
+| `doc_type` | query | no | `a4` (default) or `cheque`. Its physical size sets the resolution target and the flattened size. |
 
 ```bash
-curl -X POST http://127.0.0.1:8000/score \
-  -F "file=@devis.jpg" \
-  -F "lang=fra"   # or: ?lang=fra
+curl -X POST "http://127.0.0.1:8000/score?doc_type=a4" -F "file=@claim.jpg"
 ```
 
-The file type is decided by the file's **magic bytes**, not its extension or declared content type —
-a PNG named `.pdf` is scored correctly as a PNG.
+The file type is decided by the file's **magic bytes**, not its extension or declared content type.
 
-**Example response**
+**Example response** — a claim form with a ceiling-light reflection (detail lists shortened):
 
 ```json
 {
-  "overall_score": 90.33,
-  "overall_label": "excellent",
+  "accepted": false,
+  "overall_score": 6.29,
+  "overall_label": "poor",
+  "failed_checks": ["glare"],
+  "retake_message": "Tilt the phone slightly to remove the reflection.",
   "checks": [
     {
-      "name": "sharpness",
-      "score": 100.0,
+      "name": "framing",
+      "score": 99.84,
       "label": "excellent",
-      "raw_value": 1500.31,
-      "raw_metric": "Laplacian variance",
-      "details": { "working_max_dim": 1500, "duration_ms": 8.85 }
+      "raw_value": 7.993,
+      "raw_metric": "worst-side resolution (px per mm of document)",
+      "details": { "document_found": true, "doc_type": "a4", "in_frame": true, "rotation_deg": 0.0, "duration_ms": 13.59 },
+      "retake_message": "Move closer to the document."
     },
     {
-      "name": "lighting_uniformity",
-      "score": 74.96,
-      "label": "good",
-      "raw_value": 14.27,
-      "raw_metric": "std-dev of per-cell mean brightness (0-255)",
-      "details": { "grid": "8x8", "darkest_cell": 206.26, "brightest_cell": 245.0, "duration_ms": 1.57 }
+      "name": "sharpness",
+      "score": 95.07,
+      "label": "excellent",
+      "raw_value": 0.0863,
+      "raw_metric": "10th-percentile tile ratio Var(Laplacian)/Var(intensity)",
+      "details": { "text_tiles": 341, "tile_px": 64, "median_ratio": 0.1103, "duration_ms": 87.48 },
+      "retake_message": "Hold the phone still and parallel to the document."
+    },
+    {
+      "name": "shadows",
+      "score": 100.0,
+      "label": "excellent",
+      "raw_value": 0.996,
+      "raw_metric": "paper brightness ratio p5/p95 (0-1)",
+      "details": { "dark_paper": 246.0, "bright_paper": 247.0, "duration_ms": 100.57 },
+      "retake_message": "Move to even light and avoid casting a shadow on the document."
+    },
+    {
+      "name": "glare",
+      "score": 6.29,
+      "label": "poor",
+      "raw_value": 0.9402,
+      "raw_metric": "largest saturated blob (% of document area)",
+      "details": { "largest_blob_px": 36922, "blob_count": 1, "duration_ms": 55.47 },
+      "retake_message": "Tilt the phone slightly to remove the reflection."
     },
     {
       "name": "contrast",
-      "score": 76.71,
-      "label": "good",
-      "raw_value": 52.66,
-      "raw_metric": "RMS contrast (std-dev of intensity, 0-255)",
-      "details": { "duration_ms": 4.78 }
-    },
-    {
-      "name": "skew",
       "score": 100.0,
       "label": "excellent",
-      "raw_value": 0.0,
-      "raw_metric": "dominant text-line angle (degrees from horizontal)",
-      "details": { "text_lines_detected": 172, "baseline_points": 980, "duration_ms": 23.81 }
-    },
-    {
-      "name": "ocr_confidence",
-      "score": 100.0,
-      "label": "excellent",
-      "raw_value": 92.98,
-      "raw_metric": "mean per-word Tesseract confidence (0-100)",
-      "details": { "word_count": 196, "lang": "eng", "duration_ms": 637.86 }
+      "raw_value": 91.5,
+      "raw_metric": "worst-cell ink/paper gap in paper-noise units",
+      "details": { "worst_ink_depth": 0.7262, "cells_measured": 8, "grid": "4x4", "duration_ms": 213.72 },
+      "retake_message": "Find more light; the text is too faint to read."
     }
   ],
-  "processing_time_ms": 681.75,
+  "processing_time_ms": 512.24,
   "file": {
-    "filename": "devis.jpg",
-    "size_bytes": 332943,
+    "filename": "claim.jpg",
+    "size_bytes": 1055284,
     "source_format": "jpeg",
     "page_count": 1,
     "scored_page": 1,
-    "width": 1200,
-    "height": 1600,
-    "render_dpi": null
+    "width": 2016,
+    "height": 2850,
+    "render_dpi": null,
+    "doc_type": "a4",
+    "document_width": 1664,
+    "document_height": 2360
   }
 }
 ```
 
-Note the timing split, measured on a 1200×1600 page: OCR took 638 ms of the 682 ms total. The four
-pixel-statistics checks together cost under 40 ms. If you need a fast pre-filter, run those four and
-skip check 5.
+The other four checks average above 95, yet the capture is rejected: the reflection covers ~0.9 %
+of the page, enough to hide a field.
+
+Every check carries a `retake_message`; only the worst failing check's is promoted to the top level.
+When no document is found, `checks` holds only `framing`.
 
 `raw_value` is the measurement *before* normalization. It is in the response on purpose: it is what
-you need to re-tune the thresholds against your own scans without re-instrumenting the service.
+you need to re-tune the thresholds against your own captures without re-instrumenting the service.
+
+**Retry budget.** The API is stateless. The capturing app should count attempts and, after three
+rejections, accept the best capture so far and flag it for manual review, so a user filing a claim
+never gets stuck in a loop.
 
 ### `GET /health`
 
 ```json
-{ "status": "ok", "version": "0.1.0", "tesseract_available": true, "tesseract_version": "5.3.4" }
+{ "status": "ok", "version": "0.2.0" }
 ```
-
-`tesseract_available: false` means every `/score` call will fail — worth alerting on.
 
 ### Errors
 
@@ -226,51 +210,39 @@ All errors share one shape:
 | Status | `code` | Cause |
 |--------|--------|-------|
 | 400 | `corrupt_file` | Empty, truncated or undecodable file |
-| 400 | `invalid_language` | `lang` is not of the form `xxx` or `xxx+yyy` |
-| 400 | `language_not_available` | `lang` is well-formed but that pack is not installed |
 | 413 | `file_too_large` | Upload exceeds 20 MB |
 | 415 | `unsupported_file_type` | Contents are not JPEG, PNG or PDF |
-| 422 | — | Missing `file` field (FastAPI's own validation) |
-| 503 | `ocr_unavailable` | Tesseract binary not found |
+| 422 | — | Missing `file`, or `doc_type` not `a4`/`cheque` (FastAPI's own validation) |
 | 503 | `pdf_render_unavailable` | poppler not found |
 
-A missing binary is deliberately a 503 rather than a low score: a deployment fault must not be
-reported as a bad scan.
+A rejected capture is **not** an error: it is a 200 with `"accepted": false`.
 
 ---
 
 ## Tuning
 
-Every threshold is a named constant at the top of the check's own module, with a comment explaining
-the choice. To recalibrate, collect real scans, read the `raw_value` fields off the responses, and
-move the anchors.
+Every threshold is a named constant at the top of its check's module, with a comment explaining
+the choice; the per-check accept thresholds are `ACCEPT_THRESHOLDS` in `scoring/pipeline.py`. To
+recalibrate, collect real captures labelled by their downstream outcome, read the `raw_value`
+fields off the responses, and move the anchors.
 
-The defaults are reasoned starting points, not measurements from your corpus. Expect to adjust:
-
-- `LOW_CONTRAST_FLOOR` / `HIGH_CONTRAST_CEILING` in `contrast.py` — sparse documents (a cheque, a
-  short quote) are mostly white paper and measure lower than a dense page, without being worse.
-- `UNIFORM_STD_FLOOR` / `UNEVEN_STD_CEILING` in `lighting.py` — see the caveat below.
-- `OCR_CONF_FLOOR` / `OCR_CONF_CEILING` in `ocr.py` — the usable band shifts with the language pack
-  and the document's vocabulary.
+The anchors were set against **synthetic** test captures, not real phone photos. See
+[docs/scores.md → Calibration](docs/scores.md#calibration) for the procedure and the risks to check
+first (auto-exposure clipping read as glare, busy surfaces, phone sharpening).
 
 ---
 
 ## Caveats
 
-- **The lighting check also responds to layout.** Cells over dense text average darker than cells
-  over margins, so a page with wide white margins registers some spread even under perfectly even
-  light. On the clean synthetic test page the check scores ~75, not 100. Calibrate the constants
-  against your own layouts rather than assuming 100 is reachable.
-- **Skew can report `unknown`.** With too few characters to fit baselines to — a near-blank page, a
-  cheque stub — the check returns a neutral score of 50 and the label `unknown` rather than guessing.
-  It contributes to the average either way, so a mostly-blank page is neither rewarded nor punished.
-- **PDF scores describe the render, not a scan.** A digital-born PDF rasterizes perfectly sharp and
-  perfectly straight, so checks 1 and 4 will report near-perfect scores that say nothing about
-  capture quality. This service is aimed at *scanned* pages; treat scores from vector PDFs with
-  suspicion.
+- **Detection needs a darker surface.** The page is found by being brighter than what it lies on.
+  A white page on a white desk, or a dark card on a light one, is rejected as not found.
+- **Rotation is not scored**, and a page turned 90° or 180° is not detected; the top edge's angle is
+  reported in `framing.details.rotation_deg` for the downstream pipeline.
+- **Glare zone rule not implemented.** For cheques, glare over the amount, the CMC7 line or the
+  signature should reject at any size; that needs the zone layout of the cheques you accept.
+- **PDF scores describe the render.** A digital-born PDF renders perfectly sharp and glare-free;
+  treat its scores as saying nothing about capture quality.
 - **Only page 1 of a PDF is scored.** `page_count` in the response tells you what was skipped.
-- **Skew is small-angle only.** A page rotated 90° or upside down is not detected; angles beyond
-  ±20° are ignored as non-text.
 - **`opencv-python` pulls in GUI libraries.** For server deployments, `opencv-python-headless` is a
   drop-in replacement with a smaller footprint and no `libgl1` dependency.
 
@@ -284,19 +256,17 @@ pytest
 ```
 
 Each check has a standalone test that generates a clean synthetic page, applies one controlled
-defect, and asserts the score moves the right way — including that known rotations are recovered to
-within 0.5°. No sample scans are committed.
-
-Tests that need the Tesseract binary skip cleanly when it is absent, so the suite runs anywhere. The
-API tests stub only `image_to_data`, so the HTTP layer and the other four checks are always
-exercised for real.
+defect, and asserts the score moves the right way. Pipeline and API tests simulate phone photos —
+the page laid on a darker surface, with sensor noise, perspective, cropping — and assert each
+defect is blamed on the right check. No sample captures are committed.
 
 ```
 tests/
-├── fixtures.py       synthetic pages + degradations (blur, tilt, gradient, wash-out)
-├── test_sharpness.py test_lighting.py test_contrast.py test_skew.py test_ocr.py
-├── test_pipeline.py  averaging, ordering, timing
-└── test_api.py       validation, error shapes, end-to-end scoring
+├── fixtures.py        synthetic pages, photo simulation + degradations
+├── test_document.py   detection and rectification
+├── test_framing.py    test_sharpness.py  test_shadows.py  test_glare.py  test_contrast.py
+├── test_pipeline.py   weakest-link gate, blame, metadata
+└── test_api.py        validation, error shapes, end-to-end decisions
 ```
 
 ---
@@ -307,22 +277,23 @@ tests/
 src/scan_quality/
 ├── loaders.py            bytes -> BGR array (PDF page 1 via pdf2image)
 ├── scoring/              pure functions: array in, CheckResult out. No FastAPI.
-│   ├── base.py           CheckResult, label thresholds, normalization helpers
-│   ├── sharpness.py  lighting.py  contrast.py  skew.py  ocr.py
-│   └── pipeline.py       runs all five, averages, times
+│   ├── base.py           CheckResult, labels, ramps, ink mask, background estimate
+│   ├── document.py       step 0: find the document, flatten it to physical size
+│   ├── framing.py  sharpness.py  shadows.py  glare.py  contrast.py
+│   └── pipeline.py       detection, all checks, weakest-link decision
 └── api/
     ├── main.py           FastAPI app, CORS, /score, /health
     └── schemas.py        Pydantic response models
 ```
 
-The `scoring/` package imports nothing from FastAPI and touches no files, so every check can be
-called directly on a NumPy array:
+The `scoring/` package imports nothing from FastAPI and touches no files:
 
 ```python
 import cv2
-from scan_quality.scoring.sharpness import score_sharpness
+from scan_quality.scoring.pipeline import score_image
 
-print(score_sharpness(cv2.imread("devis.jpg")))
+report = score_image(cv2.imread("claim.jpg"), doc_type="a4")
+print(report.accepted, report.retake_message)
 ```
 
 ---
@@ -333,5 +304,6 @@ print(score_sharpness(cv2.imread("devis.jpg")))
   carries a `TODO` at the middleware — restrict origins and methods before deploying anywhere shared.
 - Upload cap is 20 MB (`MAX_UPLOAD_BYTES`); the file is buffered in memory, so size the container
   accordingly for your expected concurrency.
-- Scoring runs in a threadpool, so a slow OCR pass will not stall other in-flight requests. OCR
-  dominates the runtime — roughly an order of magnitude more than the four pixel-statistics checks.
+- Scoring takes ~0.5 s for a 2 000 × 2 850 px photo on a laptop CPU and runs in a threadpool, so one
+  large upload does not stall other requests. Running on-device (including on live preview frames)
+  needs a port to the mobile OpenCV SDK or native code.
