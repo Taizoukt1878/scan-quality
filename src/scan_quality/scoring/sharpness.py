@@ -1,78 +1,139 @@
-"""Check 1 of 5 — sharpness / blur, via variance of the Laplacian.
+"""Sharpness — contrast-normalized Laplacian per tile, scored on the worst text.
 
 The Laplacian is a second-derivative operator: it responds to places where
-intensity changes abruptly, i.e. edges. A sharp scan of a document is almost
-entirely edges (every glyph stroke has two of them), so the Laplacian response
-is large and widely spread, giving a high variance. Blurring smears those
-transitions across many pixels, shrinking the response toward zero everywhere
-and collapsing the variance.
+intensity changes abruptly, i.e. edges. Sharp text is almost entirely edges,
+so the Laplacian carries a large share of the image's variation; blur smears
+those edges and that share collapses.
 
-So the raw metric is "how much edge energy does this image contain", and the
-score answers "is that consistent with an in-focus document scan".
+Two things make a single global measurement wrong for phone captures:
+
+* **Focus falloff.** The phone focuses on one part of the page and the far
+  edge — often where a cheque's amount or signature sits — goes soft. A
+  global variance averages the soft region away.
+* **Content density.** A cheque is mostly blank, a claim form is dense. The
+  same blur yields very different global variances on the two.
+
+So the document is cut into tiles, blank tiles are dropped, each remaining
+tile gets a sharpness ratio that does not depend on how dark its ink is, and
+the score is taken from the blurriest tenth of the text.
 """
 
 import cv2
 import numpy as np
 
 from scan_quality.scoring.base import (
+    LABEL_UNKNOWN,
     CheckResult,
+    ink_mask,
     label_for,
     log_linear_score,
-    resize_to_max_dim,
     to_grayscale,
 )
 
 # --- Tuning constants -------------------------------------------------------
 
-# Laplacian variance scales with resolution: the same physical blur measured on
-# a 4000px scan yields a far larger variance than on a 1000px one. Every image
-# is therefore resampled to this longest-side budget before measuring, so the
-# thresholds below mean the same thing for every upload.
-WORKING_MAX_DIM = 1500
+# Tile edge in pixels: 8 x 8 mm at the 8 px/mm working resolution. Small
+# enough to localize a soft corner, large enough to hold several strokes.
+TILE_PX = 64
 
-# Raw variance that scores 0. Below this the page reads as visibly out of
-# focus or motion-blurred — glyph edges have been smeared into their
-# background and OCR starts dropping whole words.
-BLUR_VARIANCE_FLOOR = 15.0
+# A tile counts as text when at least this share of its pixels is ink. Blank
+# paper tiles carry only sensor noise, which has a *high* Laplacian ratio and
+# would make a blank page look sharp.
+MIN_INK_FRACTION = 0.03
 
-# Raw variance that scores 100. A crisp 300-DPI flatbed scan of printed text
-# lands well above this; pushing the ceiling higher would only reward sensor
-# noise and over-sharpening halos, which are not quality.
-SHARP_VARIANCE_CEILING = 600.0
+# With at least this many text tiles the 10th percentile is stable; below it
+# the median of the text tiles is used instead.
+MIN_TILES_FOR_PERCENTILE = 10
+WORST_TEXT_PERCENTILE = 10.0
+
+# Score when no tile holds enough ink to measure. Neutral rather than 0: no
+# text means nothing to judge focus on, and saying "hold still" would send the
+# user after the wrong problem. A page with no readable ink is rejected by
+# the contrast check instead, with the right instruction.
+UNMEASURABLE_SCORE = 50.0
+
+# Keeps the ratio finite on perfectly flat synthetic tiles.
+VARIANCE_EPSILON = 1e-6
+
+# Gaussian pre-smoothing (sigma, px) before the Laplacian. Sensor grain is
+# pixel-to-pixel and the bare 3x3 Laplacian amplifies it ~20x, so on a
+# grainy or washed-out photo the ratio would measure the noise, not the text.
+# One pixel of smoothing removes most of that and leaves any blur worth
+# rejecting (sigma >= ~1.5 px, i.e. 0.2 mm) clearly measurable.
+PRESMOOTH_SIGMA_PX = 1.0
+
+# Ratio that scores 0: blur of ~0.3 mm (sigma ~2.5 px), where small print
+# merges into its neighbours.
+BLUR_RATIO_FLOOR = 0.005
+
+# Ratio that scores 100: crisp text at 8 px/mm, with no more than ~0.1 mm of
+# blur. Higher values only come from over-sharpening halos.
+SHARP_RATIO_CEILING = 0.10
 
 CHECK_NAME = "sharpness"
+RETAKE_MESSAGE = "Hold the phone still and parallel to the document."
 
 
-def laplacian_variance(image: np.ndarray) -> float:
-    """Return the raw Laplacian variance of ``image`` at the working size.
+def tile_sharpness(image: np.ndarray) -> np.ndarray:
+    """Return the sharpness ratio of every text tile, in no particular order.
 
-    Exposed separately from :func:`score_sharpness` so the unnormalized
-    measurement can be inspected or re-tuned against real scans.
+    The ratio is ``Var(Laplacian) / Var(intensity)`` on the lightly smoothed
+    image: the share of the tile's variation that sits in fine detail.
+    Dividing by the intensity variance makes it independent of ink darkness,
+    so a pale pencil line and a black laser line of the same sharpness score
+    alike.
     """
     gray = to_grayscale(image)
-    gray = resize_to_max_dim(gray, WORKING_MAX_DIM)
-    # CV_64F keeps the negative half of the Laplacian response; an unsigned
-    # output type would clip it to zero and roughly halve the variance.
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    ink = ink_mask(gray)
+    intensity = cv2.GaussianBlur(gray.astype(np.float64), (0, 0), PRESMOOTH_SIGMA_PX)
+    laplacian = cv2.Laplacian(intensity, cv2.CV_64F)
+
+    ratios = []
+    height, width = gray.shape
+    for top in range(0, height - TILE_PX + 1, TILE_PX):
+        for left in range(0, width - TILE_PX + 1, TILE_PX):
+            window = (slice(top, top + TILE_PX), slice(left, left + TILE_PX))
+            if ink[window].mean() < MIN_INK_FRACTION:
+                continue
+            ratios.append(laplacian[window].var() / (intensity[window].var() + VARIANCE_EPSILON))
+    return np.asarray(ratios, dtype=np.float64)
 
 
-def score_sharpness(image: np.ndarray) -> CheckResult:
-    """Score how in-focus a document image is, from 0 (blurred) to 100 (crisp).
+def score_sharpness(document: np.ndarray) -> CheckResult:
+    """Score how sharp the blurriest part of the text is, 0 (blurred) to 100 (crisp).
 
-    The raw Laplacian variance is mapped onto the score with a *logarithmic*
-    ramp between :data:`BLUR_VARIANCE_FLOOR` and
-    :data:`SHARP_VARIANCE_CEILING`. Log rather than linear because the metric
-    spans orders of magnitude — the perceptual gap between variance 20 and 60
-    is much larger than between 500 and 540, and a linear ramp would squash
-    every ordinary scan into the bottom of the range.
+    Log ramp from :data:`BLUR_RATIO_FLOOR` (0) to :data:`SHARP_RATIO_CEILING`
+    (100): the ratio falls by more than an order of magnitude as blur grows,
+    and the visible difference between 0.005 and 0.015 is far larger than
+    between 0.09 and 0.10.
+    A document with no text tiles scores the neutral
+    :data:`UNMEASURABLE_SCORE` with the label ``"unknown"``.
     """
-    variance = laplacian_variance(image)
-    score = log_linear_score(variance, BLUR_VARIANCE_FLOOR, SHARP_VARIANCE_CEILING)
+    ratios = tile_sharpness(document)
+    details = {"text_tiles": int(ratios.size), "tile_px": TILE_PX}
+
+    if ratios.size == 0:
+        return CheckResult(
+            name=CHECK_NAME,
+            score=UNMEASURABLE_SCORE,
+            label=LABEL_UNKNOWN,
+            raw_value=None,
+            raw_metric="10th-percentile tile ratio Var(Laplacian)/Var(intensity)",
+            details={**details, "reason": "no text found on the document"},
+            retake_message=RETAKE_MESSAGE,
+        )
+
+    if ratios.size >= MIN_TILES_FOR_PERCENTILE:
+        worst = float(np.percentile(ratios, WORST_TEXT_PERCENTILE))
+    else:
+        worst = float(np.median(ratios))
+    score = log_linear_score(worst, BLUR_RATIO_FLOOR, SHARP_RATIO_CEILING)
     return CheckResult(
         name=CHECK_NAME,
         score=round(score, 2),
         label=label_for(score),
-        raw_value=round(variance, 2),
-        raw_metric="Laplacian variance",
-        details={"working_max_dim": WORKING_MAX_DIM},
+        raw_value=round(worst, 4),
+        raw_metric="10th-percentile tile ratio Var(Laplacian)/Var(intensity)",
+        details={**details, "median_ratio": round(float(np.median(ratios)), 4)},
+        retake_message=RETAKE_MESSAGE,
     )
