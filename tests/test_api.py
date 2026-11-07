@@ -1,9 +1,6 @@
-"""HTTP layer: validation, error shapes and the happy path.
+"""HTTP layer: validation, error shapes and the accept/reject happy path.
 
-The happy-path tests stub Tesseract's ``image_to_data`` rather than skipping,
-so the full pipeline and response serialization are exercised even on a
-machine without the binary installed. The stub is the only thing faked — all
-five checks run for real on real pixels.
+Nothing is stubbed: every check runs for real on real pixels.
 """
 
 import cv2
@@ -14,7 +11,7 @@ from fastapi.testclient import TestClient
 from scan_quality.api.main import MAX_UPLOAD_BYTES, app
 from tests import fixtures
 
-EXPECTED_CHECKS = {"sharpness", "lighting_uniformity", "contrast", "skew", "ocr_confidence"}
+EXPECTED_CHECKS = {"framing", "sharpness", "shadows", "glare", "contrast"}
 
 
 @pytest.fixture
@@ -22,22 +19,9 @@ def client() -> TestClient:
     return TestClient(app)
 
 
-@pytest.fixture
-def stub_tesseract(monkeypatch):
-    """Make the OCR check return a fixed, plausible confidence."""
-    import scan_quality.scoring.ocr as ocr_module
-
-    # Also bypass the language-pack check, so these tests keep running on a
-    # machine that has no Tesseract installed at all.
-    monkeypatch.setattr(ocr_module, "_require_languages", lambda lang: None)
-
-    def fake_image_to_data(image, **kwargs):
-        return {
-            "conf": ["-1", "88", "91", "76", "84"],
-            "text": ["", "Devis", "numero", "Total", "EUR"],
-        }
-
-    monkeypatch.setattr(ocr_module.pytesseract, "image_to_data", fake_image_to_data)
+@pytest.fixture(scope="module")
+def photo() -> np.ndarray:
+    return fixtures.photo_of(fixtures.a4_page())
 
 
 def _png_bytes(image: np.ndarray) -> bytes:
@@ -52,77 +36,82 @@ def _jpeg_bytes(image: np.ndarray) -> bytes:
     return buffer.tobytes()
 
 
+def _post(client, payload, name="capture.jpg", content_type="image/jpeg", **params):
+    return client.post("/score", files={"file": (name, payload, content_type)}, params=params)
+
+
 def test_health_reports_status_and_version(client):
     response = client.get("/health")
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert isinstance(body["tesseract_available"], bool)
+    assert response.json()["status"] == "ok"
 
 
-def test_score_returns_all_five_checks(client, stub_tesseract):
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("devis.png", payload, "image/png")})
+def test_clean_capture_is_accepted(client, photo):
+    response = _post(client, _jpeg_bytes(photo))
 
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["accepted"] is True
+    assert body["failed_checks"] == []
+    assert body["retake_message"] is None
     assert {check["name"] for check in body["checks"]} == EXPECTED_CHECKS
-    assert 0 <= body["overall_score"] <= 100
-    assert body["overall_label"] in {"excellent", "good", "fair", "poor"}
 
 
-def test_overall_score_is_the_mean_of_the_five(client, stub_tesseract):
-    payload = _png_bytes(fixtures.clean_page())
-    body = client.post("/score", files={"file": ("d.png", payload, "image/png")}).json()
-    mean = sum(check["score"] for check in body["checks"]) / 5
-    assert body["overall_score"] == pytest.approx(mean, abs=0.01)
+def test_overall_score_is_the_minimum(client, photo):
+    body = _post(client, _jpeg_bytes(photo)).json()
+    assert body["overall_score"] == pytest.approx(min(c["score"] for c in body["checks"]), abs=0.01)
 
 
-def test_response_reports_file_metadata_and_timing(client, stub_tesseract):
-    page = fixtures.clean_page(width=800, height=1000)
-    payload = _jpeg_bytes(page)
-    body = client.post("/score", files={"file": ("scan.jpg", payload, "image/jpeg")}).json()
+def test_bad_capture_is_rejected_with_an_instruction(client):
+    glare = fixtures.photo_of(fixtures.glare_spot(fixtures.a4_page(), size_px=(260, 180)))
+    body = _post(client, _jpeg_bytes(glare)).json()
+    assert body["accepted"] is False
+    assert body["failed_checks"][0] == "glare"
+    assert body["retake_message"]
+
+
+def test_response_reports_file_metadata_and_timing(client, photo):
+    payload = _jpeg_bytes(photo)
+    body = _post(client, payload, name="scan.jpg").json()
 
     assert body["file"]["filename"] == "scan.jpg"
     assert body["file"]["source_format"] == "jpeg"
     assert body["file"]["size_bytes"] == len(payload)
-    assert body["file"]["width"] == 800
-    assert body["file"]["height"] == 1000
-    assert body["file"]["scored_page"] == 1
+    assert body["file"]["width"] == photo.shape[1]
+    assert body["file"]["height"] == photo.shape[0]
+    assert body["file"]["doc_type"] == "a4"
+    assert body["file"]["document_width"] > 0
     assert body["processing_time_ms"] > 0
 
 
-def test_a_bad_scan_scores_below_a_clean_one(client, stub_tesseract):
-    """End-to-end sanity: the API ranks scans the way a human would."""
-    clean = fixtures.clean_page()
-    ruined = fixtures.low_contrast(
-        fixtures.uneven_lighting(fixtures.blurred(fixtures.rotated(clean, 4.0), 15), 0.7), 0.4
-    )
-    scores = [
-        client.post("/score", files={"file": ("x.png", _png_bytes(image), "image/png")}).json()[
-            "overall_score"
-        ]
-        for image in (clean, ruined)
-    ]
-    assert scores[0] > scores[1]
+def test_doc_type_changes_the_resolution_target(client):
+    cheque = fixtures.photo_of(fixtures.clean_page(width=1400, height=640, line_count=5))
+    as_cheque = _post(client, _jpeg_bytes(cheque), doc_type="cheque").json()
+    as_a4 = _post(client, _jpeg_bytes(cheque), doc_type="a4").json()
+    framing = {body["file"]["doc_type"]: next(c for c in body["checks"] if c["name"] == "framing")
+               for body in (as_cheque, as_a4)}
+    assert framing["cheque"]["raw_value"] > framing["a4"]["raw_value"]
 
 
-def test_file_type_is_detected_from_content_not_extension(client, stub_tesseract):
-    """A PNG named .pdf with an image content type is still scored as a PNG."""
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("misnamed.pdf", payload, "application/pdf")})
+def test_unknown_doc_type_is_rejected(client, photo):
+    assert _post(client, _jpeg_bytes(photo), doc_type="passport").status_code == 422
+
+
+def test_file_type_is_detected_from_content_not_extension(client, photo):
+    """A PNG named .pdf with a PDF content type is still scored as a PNG."""
+    response = _post(client, _png_bytes(photo), name="misnamed.pdf", content_type="application/pdf")
     assert response.status_code == 200
     assert response.json()["file"]["source_format"] == "png"
 
 
 def test_unsupported_file_type_is_rejected(client):
-    response = client.post("/score", files={"file": ("notes.txt", b"just some text", "text/plain")})
+    response = _post(client, b"just some text", name="notes.txt", content_type="text/plain")
     assert response.status_code == 415
     assert response.json()["error"]["code"] == "unsupported_file_type"
 
 
 def test_empty_file_is_rejected(client):
-    response = client.post("/score", files={"file": ("empty.png", b"", "image/png")})
+    response = _post(client, b"", name="empty.png", content_type="image/png")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "corrupt_file"
 
@@ -130,88 +119,20 @@ def test_empty_file_is_rejected(client):
 def test_truncated_image_is_rejected(client):
     """Correct magic bytes, unusable contents."""
     truncated = _png_bytes(fixtures.clean_page())[:120]
-    response = client.post("/score", files={"file": ("cut.png", truncated, "image/png")})
+    response = _post(client, truncated, name="cut.png", content_type="image/png")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "corrupt_file"
 
 
 def test_oversized_upload_is_rejected(client):
     oversized = b"\x89PNG\r\n\x1a\n" + b"\x00" * MAX_UPLOAD_BYTES
-    response = client.post("/score", files={"file": ("big.png", oversized, "image/png")})
+    response = _post(client, oversized, name="big.png", content_type="image/png")
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "file_too_large"
 
 
-@pytest.mark.parametrize("lang", ["../etc", "en", "fra;rm -rf", "FRA"])
-def test_invalid_language_is_rejected(client, lang):
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post(
-        "/score", files={"file": ("d.png", payload, "image/png")}, params={"lang": lang}
-    )
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "invalid_language"
-
-
-def test_uninstalled_language_returns_400_not_500(client):
-    """Asking for a pack the server lacks must be a clear error, not a crash.
-
-    Tesseract's own failure mode here is an opaque message about
-    TESSDATA_PREFIX, so the service checks the packs up front instead.
-    """
-    from scan_quality.scoring.ocr import available_languages, is_tesseract_available
-
-    if not is_tesseract_available():
-        pytest.skip("Tesseract binary not installed")
-    if "zzz" in available_languages():
-        pytest.skip("improbable language pack is actually installed")
-
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post(
-        "/score", files={"file": ("d.png", payload, "image/png")}, params={"lang": "zzz"}
-    )
-    assert response.status_code == 400
-    body = response.json()
-    assert body["error"]["code"] == "language_not_available"
-    # The message must name what is missing and what is available.
-    assert "zzz" in body["error"]["message"]
-    assert "Available:" in body["error"]["message"]
-
-
-def test_unexpected_tesseract_failure_returns_503(client, monkeypatch):
-    """Engine errors must be wrapped, not escape as an unhandled 500."""
-    from pytesseract import TesseractError
-
-    import scan_quality.scoring.ocr as ocr_module
-
-    monkeypatch.setattr(ocr_module, "_require_languages", lambda lang: None)
-
-    def explode(*args, **kwargs):
-        raise TesseractError(1, "corrupt traineddata")
-
-    monkeypatch.setattr(ocr_module.pytesseract, "image_to_data", explode)
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("d.png", payload, "image/png")})
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "ocr_unavailable"
-
-
 def test_missing_file_field_is_rejected(client):
     assert client.post("/score").status_code == 422
-
-
-def test_missing_tesseract_returns_503(client, monkeypatch):
-    from pytesseract import TesseractNotFoundError
-
-    import scan_quality.scoring.ocr as ocr_module
-
-    def explode(*args, **kwargs):
-        raise TesseractNotFoundError()
-
-    monkeypatch.setattr(ocr_module.pytesseract, "image_to_data", explode)
-    payload = _png_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("d.png", payload, "image/png")})
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "ocr_unavailable"
 
 
 def _pdf_bytes(image: np.ndarray) -> bytes:
@@ -221,23 +142,23 @@ def _pdf_bytes(image: np.ndarray) -> bytes:
     from PIL import Image
 
     buffer = io.BytesIO()
-    Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(buffer, format="PDF")
+    Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).save(buffer, format="PDF", resolution=200)
     return buffer.getvalue()
 
 
 @pytest.mark.skipif(
     __import__("shutil").which("pdftoppm") is None, reason="poppler not installed"
 )
-def test_pdf_first_page_is_scored(client, stub_tesseract):
-    payload = _pdf_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("devis.pdf", payload, "application/pdf")})
+def test_pdf_page_is_scored_without_detection(client):
+    payload = _pdf_bytes(fixtures.a4_page())
+    response = _post(client, payload, name="devis.pdf", content_type="application/pdf")
 
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["file"]["source_format"] == "pdf"
-    assert body["file"]["scored_page"] == 1
     assert body["file"]["render_dpi"] == 200
-    assert {check["name"] for check in body["checks"]} == EXPECTED_CHECKS
+    framing = next(c for c in body["checks"] if c["name"] == "framing")
+    assert framing["details"]["in_frame"] is True
 
 
 @pytest.mark.skipif(
@@ -245,7 +166,7 @@ def test_pdf_first_page_is_scored(client, stub_tesseract):
 )
 def test_pdf_without_poppler_returns_503(client):
     payload = _pdf_bytes(fixtures.clean_page())
-    response = client.post("/score", files={"file": ("devis.pdf", payload, "application/pdf")})
+    response = _post(client, payload, name="devis.pdf", content_type="application/pdf")
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "pdf_render_unavailable"
 

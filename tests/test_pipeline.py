@@ -1,75 +1,79 @@
-"""The pipeline runs all five checks and averages them without weighting."""
+"""The pipeline finds the document, runs every check, and gates on the weakest."""
 
-import numpy as np
 import pytest
 
-from scan_quality.scoring.ocr import is_tesseract_available
-from scan_quality.scoring.pipeline import score_image
+from scan_quality.scoring.pipeline import ACCEPT_THRESHOLDS, score_image
 from tests import fixtures
 
-EXPECTED_CHECKS = [
-    "sharpness",
-    "lighting_uniformity",
-    "contrast",
-    "skew",
-    "ocr_confidence",
-]
-
-requires_tesseract = pytest.mark.skipif(
-    not is_tesseract_available(), reason="Tesseract binary not installed"
-)
+EXPECTED_CHECKS = ["framing", "sharpness", "shadows", "glare", "contrast"]
 
 
-@requires_tesseract
-def test_report_contains_all_five_checks_in_order():
-    report = score_image(fixtures.clean_page())
+@pytest.fixture(scope="module")
+def page():
+    return fixtures.a4_page()
+
+
+def test_clean_capture_is_accepted(page):
+    report = score_image(fixtures.photo_of(page))
     assert [check.name for check in report.checks] == EXPECTED_CHECKS
+    assert report.accepted
+    assert report.failed_checks == []
+    assert report.retake_message is None
 
 
-@requires_tesseract
-def test_overall_is_the_unweighted_mean():
-    report = score_image(fixtures.clean_page())
-    expected = float(np.mean([check.score for check in report.checks]))
-    assert report.overall_score == pytest.approx(expected, abs=0.01)
+def test_overall_is_the_minimum(page):
+    report = score_image(fixtures.photo_of(page))
+    assert report.overall_score == pytest.approx(min(check.score for check in report.checks), abs=0.01)
 
 
-@requires_tesseract
-def test_clean_page_beats_thoroughly_degraded_page():
-    clean = fixtures.clean_page()
-    ruined = fixtures.low_contrast(
-        fixtures.uneven_lighting(fixtures.blurred(fixtures.rotated(clean, 4.0), 15), 0.7),
-        0.4,
-    )
-    assert score_image(clean).overall_score > score_image(ruined).overall_score
+def test_one_fatal_defect_rejects_despite_good_others(page):
+    """A mean of these scores would pass; the gate must not."""
+    report = score_image(fixtures.photo_of(fixtures.glare_spot(page, size_px=(260, 180))))
+    others = [check.score for check in report.checks if check.name != "glare"]
+    assert sum(others) / len(others) > 90
+    assert not report.accepted
+    assert report.failed_checks == ["glare"]
+    assert "reflection" in report.retake_message
 
 
-@requires_tesseract
-def test_timing_and_metadata_are_reported():
-    page = fixtures.clean_page(width=900, height=1200)
-    report = score_image(page)
+@pytest.mark.parametrize(
+    "degrade, failing",
+    [
+        pytest.param(lambda p: fixtures.blurred(p, 21), "sharpness", id="blurred"),
+        pytest.param(lambda p: fixtures.hard_shadow(p, darkness=0.45), "shadows", id="shadow"),
+        pytest.param(lambda p: fixtures.low_contrast(p, 0.05), "contrast", id="washed_out"),
+    ],
+)
+def test_each_defect_is_blamed_on_its_check(page, degrade, failing):
+    report = score_image(fixtures.photo_of(degrade(page)))
+    assert not report.accepted
+    assert report.failed_checks[0] == failing
+
+
+def test_missing_document_reports_only_framing():
+    """With no document the pixel checks would be measuring the table."""
+    report = score_image(fixtures.photo_of(fixtures.a4_page(), surface_value=240))
+    assert [check.name for check in report.checks] == ["framing"]
+    assert not report.accepted
+    assert report.retake_message
+
+
+def test_rendered_page_skips_detection(page):
+    report = score_image(page, whole_frame=True)
+    assert report.accepted
+    assert report.checks[0].details["in_frame"] is True
+
+
+def test_timing_and_metadata_are_reported(page):
+    report = score_image(fixtures.photo_of(page))
     assert report.processing_time_ms > 0
-    assert report.meta == {"width": 900, "height": 1200}
+    assert report.meta["doc_type"] == "a4"
+    assert report.meta["document_width"] > 0
     assert all("duration_ms" in check.details for check in report.checks)
 
 
-@requires_tesseract
-def test_scores_stay_in_range():
-    for image in (fixtures.clean_page(), fixtures.blank_page()):
-        report = score_image(image)
-        assert 0.0 <= report.overall_score <= 100.0
-        assert all(0.0 <= check.score <= 100.0 for check in report.checks)
-
-
-def test_ocr_failure_propagates(monkeypatch):
-    """A missing binary must surface, not be averaged away into a low score."""
-    from pytesseract import TesseractNotFoundError
-
-    import scan_quality.scoring.ocr as ocr_module
-    from scan_quality.scoring.ocr import OcrUnavailableError
-
-    def explode(*args, **kwargs):
-        raise TesseractNotFoundError()
-
-    monkeypatch.setattr(ocr_module.pytesseract, "image_to_data", explode)
-    with pytest.raises(OcrUnavailableError):
-        score_image(fixtures.clean_page())
+def test_every_check_has_a_threshold_and_a_message(page):
+    report = score_image(fixtures.photo_of(page))
+    for check in report.checks:
+        assert check.name in ACCEPT_THRESHOLDS
+        assert check.retake_message
