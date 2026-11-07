@@ -22,11 +22,10 @@ PDF_MAGIC = b"%PDF"
 JPEG_MAGIC = b"\xff\xd8\xff"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
-# Resolution at which PDF pages are rasterized. 200 DPI is the sweet spot for
-# this service: high enough that Tesseract reads body text comfortably (it is
-# trained around 300 DPI, and the OCR check works well from 200 up), low
-# enough that an A4 page stays about 1650x2340 rather than the 2480x3508 that
-# 300 DPI would cost in memory and render time.
+# Resolution at which PDF pages are rasterized. 200 DPI is ~7.9 px/mm, the
+# working resolution every check is calibrated at (scoring.document.PX_PER_MM),
+# so a rendered page is scored at the same detail as a good phone capture
+# without paying for 300 DPI in memory and render time.
 PDF_RENDER_DPI = 200
 
 
