@@ -1,12 +1,14 @@
-"""Shared primitives for the five scan-quality checks.
+"""Shared primitives for the capture-quality checks.
 
-Every check module in this package follows the same contract:
+Every pixel check module in this package follows the same contract:
 
-    score_<check>(image: np.ndarray) -> CheckResult
+    score_<check>(document: np.ndarray) -> CheckResult
 
-The input is a raw image array as decoded by OpenCV (either 3-channel BGR or
-single-channel grayscale); the output is a :class:`CheckResult` carrying both
-the normalized 0-100 score and the raw physical measurement it came from.
+The input is the *rectified document* produced by
+:mod:`scan_quality.scoring.document` — the page cut out of the photo and
+flattened to a known physical size — as a 3-channel BGR or single-channel
+grayscale array. The output is a :class:`CheckResult` carrying both the
+normalized 0-100 score and the raw physical measurement it came from.
 
 Checks are pure functions of the pixel data: no I/O, no FastAPI, no globals.
 That keeps them trivially testable (feed an array, assert on the score) and
@@ -21,15 +23,15 @@ import numpy as np
 
 # --- Label thresholds -------------------------------------------------------
 # The same score->word mapping is applied to every check and to the overall
-# average, so a "good" sharpness and a "good" contrast mean the same thing to
+# score, so a "good" sharpness and a "good" contrast mean the same thing to
 # whoever reads the JSON. Boundaries are inclusive lower bounds.
 #
-# The cut points are set so that a score of 50 is the pass/fail line: below it
-# the scan has a defect a human would notice and probably re-scan for.
+# The cut points are set so that a score of 50 is the default accept line: below it
+# the capture has a defect a human would notice and should be retaken.
 LABEL_EXCELLENT_MIN = 85.0  # visually indistinguishable from a clean scan
 LABEL_GOOD_MIN = 70.0       # minor imperfection, OCR unaffected in practice
-LABEL_FAIR_MIN = 50.0       # usable but degraded; OCR may drop words
-# Anything below LABEL_FAIR_MIN is "poor" -> re-scan recommended.
+LABEL_FAIR_MIN = 50.0       # usable but degraded; default accept threshold
+# Anything below LABEL_FAIR_MIN is "poor" -> retake.
 
 LABEL_UNKNOWN = "unknown"   # used when a check cannot measure anything at all
 
@@ -44,13 +46,15 @@ class CheckResult:
             the only field that participates in the overall average.
         label: Human-readable bucket for ``score`` ("excellent" ... "poor").
         raw_value: The underlying physical measurement before normalization
-            (Laplacian variance, degrees of skew, ...). Kept in the response so
+            (tile sharpness ratio, px/mm, ...). Kept in the response so
             you can re-tune the module constants against real-world scans
             without re-instrumenting the service. ``None`` when the check could
             not measure the image at all.
         raw_metric: Human-readable name and unit of ``raw_value``.
-        details: Optional extra diagnostics specific to one check (word counts,
-            grid dimensions, ...). Never used in scoring.
+        details: Optional extra diagnostics specific to one check (tile counts,
+            corner positions, ...). Never used in scoring.
+        retake_message: The instruction to show the user if this check is the
+            one that rejects the capture.
     """
 
     name: str
@@ -59,12 +63,13 @@ class CheckResult:
     raw_value: float | None
     raw_metric: str
     details: dict[str, Any] = field(default_factory=dict)
+    retake_message: str | None = None
 
 
 def label_for(score: float) -> str:
     """Map a 0-100 score onto the shared quality vocabulary.
 
-    Uses the LABEL_* constants above so that all five checks and the overall
+    Uses the LABEL_* constants above so that every check and the overall
     score speak the same language.
     """
     if score >= LABEL_EXCELLENT_MIN:
@@ -87,7 +92,7 @@ def linear_score(value: float, zero_at: float, hundred_at: float) -> float:
     ``zero_at`` is the raw value that earns a score of 0 and ``hundred_at`` the
     raw value that earns 100. The mapping is deliberately direction-agnostic:
     when ``zero_at > hundred_at`` the scale inverts, which is what "lower is
-    better" metrics (skew angle, lighting spread) need.
+    better" metrics (glare area) need.
 
     Values beyond either anchor are clamped rather than extrapolated, so a
     wildly sharp image cannot earn 130 and drag an average upward.
@@ -135,6 +140,67 @@ def to_grayscale(image: np.ndarray) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported image shape for grayscale conversion: {image.shape}")
     return gray if gray.dtype == np.uint8 else cv2.convertScaleAbs(gray)
+
+
+def min_channel(image: np.ndarray) -> np.ndarray:
+    """Return the per-pixel minimum over the colour channels, as uint8.
+
+    Paper is bright in every channel, but any coloured ink is dark in at
+    least one: red stamps in green and blue, blue ballpoint in red. Taking the
+    minimum keeps every ink dark, where a luminance conversion would let a
+    pale red stamp fade almost into the paper. Grayscale input is returned
+    unchanged.
+    """
+    if image.ndim == 2:
+        return image
+    return image[:, :, :3].min(axis=2)
+
+
+# Ink removal for background estimation: a closing (dilate then erode) with a
+# kernel wider than any pen or print stroke fills ink in with the surrounding
+# paper. 15 px is ~2 mm at the 8 px/mm working resolution.
+BACKGROUND_CLOSE_PX = 15
+# Smoothing after ink removal, so what remains is the slowly varying light
+# falling on the paper rather than paper texture: a median over ~6 mm. A
+# median rather than a Gaussian because it keeps a hard shadow edge sharp; a
+# blurred edge would leave a band of mis-corrected paper that reads as faint
+# ink. Must be odd.
+BACKGROUND_MEDIAN_PX = 51
+
+
+def estimate_background(gray: np.ndarray) -> np.ndarray:
+    """Estimate the paper's brightness at every pixel, with the ink removed.
+
+    Used to flat-field correct the page (divide by it) and, on its own, to
+    measure shadows. Large dark regions — a black logo block, a photo — are
+    wider than the closing kernel and survive as dark background.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (BACKGROUND_CLOSE_PX, BACKGROUND_CLOSE_PX))
+    closed = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    return cv2.medianBlur(closed, BACKGROUND_MEDIAN_PX)
+
+
+# Adaptive (rather than Otsu) binarization: a single global threshold loses
+# the shadowed half of an unevenly lit page. Block size must be odd and
+# comfortably larger than one character stroke; C is subtracted from the local
+# mean to keep faint paper texture out of the foreground.
+INK_BLOCK_SIZE = 31
+INK_C = 10
+# Opening applied to the mask. Sensor noise crosses the threshold as isolated
+# single pixels, while every real stroke is at least ~2 px (0.25 mm) wide, so
+# a 2 x 2 opening keeps the strokes and drops the noise. Without it, blank
+# paper on a grainy photo would count as faint ink.
+INK_OPEN_PX = 2
+
+
+def ink_mask(gray: np.ndarray) -> np.ndarray:
+    """Return a boolean mask that is True on ink pixels."""
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        INK_BLOCK_SIZE, INK_C,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (INK_OPEN_PX, INK_OPEN_PX))
+    return cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel) > 0
 
 
 def resize_to_max_dim(image: np.ndarray, max_dim: int) -> np.ndarray:
