@@ -257,7 +257,7 @@ A user photographs a laminated insurance card under an office light. A reflectio
 100 × 60 px appears on a document of 1400 × 640 px:
 
 $$
-G = \frac{6\,000}{896\,000} = 0.670\,\% \qquad \text{score} = 100 \cdot \frac{1.0 - 0.670}{1.0 - 0.05} = 34.7 \;\rightarrow\; \texttt{poor}
+G = \frac{6\,000}{896\,000} = 0.670\,\% \qquad \text{score} = 100 \cdot \frac{1.0 - 0.670}{1.0 - 0.05} = 34.8 \;\rightarrow\; \texttt{poor}
 $$
 
 The capture is rejected with *"Tilt the phone slightly to remove the reflection"*.
@@ -431,11 +431,11 @@ A claim form photographed on a desk with a ceiling light above:
 |---|---|
 | Sharpness | 88.00 |
 | Shadows | 82.00 |
-| Glare | **34.74** |
+| Glare | **34.78** |
 | Contrast | 90.00 |
 | Framing and resolution | 85.00 |
-| **Mean (today)** | **75.95, `good`: accepted** |
-| **Minimum (recommended)** | **34.74, `poor`: rejected, "Tilt to remove the reflection"** |
+| **Mean (today)** | **75.96, `good`: accepted** |
+| **Minimum (recommended)** | **34.78, `poor`: rejected, "Tilt to remove the reflection"** |
 
 Under the mean, this form goes downstream with a field hidden under the reflection. Under the gate,
 the user retakes it in two seconds.
