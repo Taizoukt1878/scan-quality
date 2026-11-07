@@ -5,13 +5,13 @@ targets phone and kiosk captures for insurance and banking: cheques, accident re
 invoices and supporting documents. A rejected photo is never sent downstream; the user is asked to
 retake it. Accepted photos go to a dedicated OCR and extraction pipeline.
 
-Each section gives the recommended formula for this use case, how to read it, a worked example, and
-the alternatives we considered.
+Each section gives the formula, how to read it, a worked example, and the alternatives we
+considered.
 
-> **Status.** The code in [`src/scan_quality/scoring/`](../src/scan_quality/scoring/) still runs the
-> original five checks: sharpness, lighting, contrast, skew and OCR, combined with a plain mean.
-> Each section below says what runs today and what we recommend. All anchor values are reasoned
-> starting points and **must be calibrated on real captures** (see [Calibration](#calibration)).
+> **Status.** Implemented in [`src/scan_quality/scoring/`](../src/scan_quality/scoring/) (v0.2.0).
+> The anchors were set against **synthetic test captures** (see the measurements in each section).
+> They have not yet been checked against real phone photos and **must be calibrated before
+> release** (see [Calibration](#calibration)).
 
 ---
 
@@ -28,19 +28,19 @@ the alternatives we considered.
    capture, however good the other scores are. A mean hides that kind of defect.
 4. **Every failure maps to an instruction.** Each check catches one physical problem, so a
    rejection can tell the user what to do: "hold still", "avoid the reflection", "move closer".
-5. **Keep it fast enough for the live camera preview.** All checks are pixel statistics with no OCR
-   and no external binary, so they can run on preview frames and guide the user before they press
-   the shutter.
+5. **Keep it fast and self-contained.** All checks are pixel statistics with no OCR and no external
+   binary, so they can eventually run on the device.
 
-### Why OCR confidence was removed
+### Removed checks
 
-- The final OCR runs downstream and is better than Tesseract. Tesseract's confidence would be a
-  weaker estimate of a result we get anyway.
-- It was about 10× slower than the other four checks combined (638 ms out of 682 ms per request).
-  That rules out live feedback.
-- It needs the Tesseract binary and language packs on the device.
-- Its confidence depends on the language and vocabulary as much as on the image. A clean French
-  quote scored with `eng` looks worse than a blurred English one.
+**OCR confidence** was removed:
+- The final OCR runs downstream and is better than Tesseract.
+- It was about 10× slower than the other checks combined (638 ms out of 682 ms per request).
+- It needed the Tesseract binary and language packs.
+- Its confidence depended on the language as much as on the image.
+
+**Skew** was removed: rotation is fixed by rectification and by the downstream deskew. The angle is
+still reported (see [Framing](#5-framing-and-resolution)).
 
 ---
 
@@ -64,348 +64,373 @@ anchors are clamped.
 | ≥ 70 | `good` | Accept |
 | ≥ 50 | `fair` | Accept (default threshold; tune per check) |
 | < 50 | `poor` | Reject and ask for a retake |
+| 50 | `unknown` | Nothing to measure (sharpness on a page with no text); neutral |
+
+Several checks share two building blocks:
+- **Ink mask:** an adaptive threshold (block 31 px, C = 10), followed by a 2 × 2 opening that
+  removes isolated noise pixels.
+- **Background estimate $B$:** a 15 × 15 closing that removes the ink, followed by a 51 × 51 median
+  blur.
 
 ---
 
 ## Step 0: Document detection and rectification
 
-This step isn't a score, but every score below depends on it.
+Module: [`document.py`](../src/scan_quality/scoring/document.py). This step isn't a score, but every
+score below depends on it.
 
-1. Find the document's four corners, either with contours and polygon approximation or with a
-   lightweight edge-detection model.
-2. Compute the homography $H$ that maps the quad to a rectangle of the document's **known physical
-   size** at a canonical resolution of **8 px/mm** (about 200 DPI):
+1. **Find the paper.** Measure the surface brightness as the 25th percentile of a 2 % band around
+   the frame border. Measure the paper brightness as the 99th percentile of the whole frame. Every
+   pixel brighter than this threshold counts as paper:
 
-| Document type | Physical size | Rectified size |
+$$
+\text{threshold} = \text{surface} + 0.2 \cdot (\text{paper} - \text{surface})
+$$
+
+   The threshold sits low on purpose. A page half in deep shadow is still much brighter than the
+   table under it, and a threshold half-way up (where Otsu tends to place it) would cut the
+   shadowed half off. If paper and surface differ by less than 30 levels, the page can't be told
+   apart from what it lies on.
+2. **Find the corners.** Take the largest paper region, which must cover at least 15 % of the
+   frame, and simplify its convex outline to a polygon. Only a clean quadrilateral counts.
+3. **Flatten.** Warp the quad onto a rectangle of the document's **physical size** at
+   **8 px/mm** (about 200 DPI). If the photo has more detail than that, shrink it first with area
+   averaging, because warping point-samples and would otherwise create fake edges. Then trim
+   **1 mm** off every edge, where the paper still blends with the surface.
+
+| Document type (`doc_type`) | Physical size | Rectified size |
 |---|---|---|
-| French cheque | 175 × 80 mm | 1400 × 640 px |
-| A4 page (claim form, constat, invoice) | 210 × 297 mm | 1680 × 2376 px |
+| `cheque` (French format) | 175 × 80 mm | 1384 × 624 px |
+| `a4` (claim form, constat, invoice) | 210 × 297 mm | 1664 × 2360 px |
 
-3. Warp the image with $H$. All checks run on this rectified image $D$, in color.
+All checks run on this rectified image $D$, in color. A **PDF page** is a render, not a photo, so
+the whole page is used as the document and detection is skipped.
 
-If no quad is found, the capture is rejected with the message *"Place the document on a darker,
-plain surface"*. We don't fall back to the full frame, because scores computed on the frame aren't
-reliable.
+If no document is found, the capture is rejected and only the framing check is reported, with the
+message *"Fit the whole document in the frame, on a darker plain surface."* There is no fallback to
+the full frame: the other checks would be measuring the table.
 
 ---
 
 ## 1. Sharpness
 
-**Today in code:** the variance of the Laplacian over the whole frame, mapped with a log ramp
-(15 → 0, 600 → 100).
+Module: [`sharpness.py`](../src/scan_quality/scoring/sharpness.py). Replaces the global Laplacian
+variance (15 → 0, 600 → 100).
 
-### Recommended formula
+### Formula
 
-The global variance has two problems with phone captures:
-
+A single global measurement fails on phone captures in two ways:
 - **Focus falloff.** The phone focuses on one part of the page, and the far edge, where the cheque's
   amount or signature often sits, is blurred. A global variance averages that away.
 - **Content density.** A cheque is mostly blank and a claim form is dense. The same blur gives very
-  different variances on the two.
+  different global variances on the two.
 
-The recommended formula therefore measures **contrast-normalized sharpness per tile** and scores
-the **worst part** of the document:
+So sharpness is measured **per tile, normalized by contrast**, and scored on the **worst part of
+the text**:
 
-1. Split $D$ (grayscale) into 64 × 64 px tiles (8 × 8 mm).
-2. Keep only **content tiles**: tiles where at least 3 % of pixels are ink, using the adaptive
-   threshold mask from the skew code. Blank paper tiles contain only noise and are ignored.
-3. For each content tile $t$, compute the ratio of Laplacian variance to intensity variance. The
-   ratio is independent of how dark the ink is, so it measures **how much of the tile's contrast
-   sits in fine detail**:
+1. Split grayscale $D$ into 64 × 64 px tiles (8 × 8 mm). Keep only **text tiles**, where at least
+   3 % of pixels are ink.
+2. Smooth lightly with a Gaussian ($\sigma$ = 1 px) to get $\tilde D$. For each text tile, compute:
 
 $$
-r_t = \frac{\operatorname{Var}\left(\nabla^2 D_t\right)}{\operatorname{Var}\left(D_t\right) + \varepsilon}
+r_t = \frac{\operatorname{Var}\left(\nabla^2 \tilde D_t\right)}{\operatorname{Var}\left(\tilde D_t\right) + \varepsilon}
 $$
 
-4. The raw value is the **10th percentile** across content tiles. This represents the blurriest
-   tenth of the text:
+3. The raw value is the **10th percentile** over text tiles. With 1 to 9 text tiles, use the
+   median instead:
 
 $$
 R = p_{10}\left(\{ r_t \}\right)
 $$
 
-5. Score it with a log ramp, using illustrative anchors **0.1 → 0** and **2.0 → 100**.
+4. Score it with a log ramp: **0.005 → 0** and **0.10 → 100**.
 
-With fewer than 10 content tiles, for example a nearly blank document, use the median of all tiles
-instead.
+With no text tile at all, the score is a neutral **50** with label `unknown`. A page with no
+readable ink is rejected by the contrast check instead, with the right message.
 
 ### Interpretation
 
-- $R$ reads as *"how sharp is the blurriest tenth of the text?"*. A capture passes only if all of
-  the text can be read, not just most of it.
-- Motion blur from hand shake lowers $r_t$ in every tile. Focus falloff lowers it in some tiles
-  only, and the percentile catches that.
-- The 10th percentile, rather than the minimum, stops a single odd tile from rejecting a good
-  capture. An odd tile can be a stamp, a smudge or a fold.
+- $r_t$ is the share of a tile's variation that sits in fine detail. Dividing by the intensity
+  variance makes it independent of how dark the ink is, so pale ink isn't mistaken for blur.
+- **Why the 1 px pre-smoothing:** the bare 3 × 3 Laplacian amplifies sensor grain about 20×. On a
+  grainy or washed-out photo it would measure the noise, not the text; without the smoothing, a
+  heavily blurred page scored as sharp once noise was added. One pixel of smoothing removes the
+  noise, and any blur worth rejecting (σ ≥ 1.5 px, i.e. 0.2 mm) stays measurable.
+- $R$ reads as *"how sharp is the blurriest tenth of the text?"*. The 10th percentile, rather than
+  the minimum, stops a single stamp or fold from rejecting a good capture.
+
+### Measured on synthetic pages (sensor noise σ = 3)
+
+| Page | $R$ | Score |
+|---|---|---|
+| Clean | 0.128 | 100 |
+| Slight blur (σ ≈ 0.8 px, 0.1 mm) | 0.085 | 94.6 |
+| Moderate blur (σ ≈ 1.7 px, 0.2 mm) | 0.023 | 50.7 |
+| Heavy blur (σ ≈ 3.8 px, 0.5 mm) | 0.002 | 0 |
+| Right half blurred only | 0.018 | 42.4, rejected |
+| Same noise at σ = 8, or ink washed out to 25 % | ≈ 0.13 | 100 (unchanged) |
 
 ### Example
 
-A user photographs a cheque at an angle. The phone focuses on the left side, where the payee line
-is. The right side, with the amount box and the signature, is soft. There are 48 content tiles:
+A user photographs a cheque at an angle. The phone focuses on the payee line on the left, and the
+amount box on the right is soft:
 
 | Statistic | Value | Score |
 |---|---|---|
-| Median $r_t$ (what a global measure sees) | 1.6 | $100 \cdot \log_{10}(16)/\log_{10}(20) = 92.55$, `excellent` |
-| $p_{10}$ of $r_t$ (recommended) | 0.35 | $100 \cdot \log_{10}(3.5)/\log_{10}(20) = 41.82$, **`poor`** |
+| Median $r_t$ (what a global measure sees) | 0.09 | $100 \cdot \log_{10}(18)/\log_{10}(20) = 96.5$, `excellent` |
+| $p_{10}$ of $r_t$ (used) | 0.012 | $100 \cdot \log_{10}(2.4)/\log_{10}(20) = 29.2$, **`poor`** |
 
-A global score would accept this cheque even though the amount can't be read. The tiled score
-rejects it with the message *"Hold the phone parallel to the document"*.
+A global score would accept a cheque whose amount can't be read. The tiled score rejects it with
+*"Hold the phone still and parallel to the document."*
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| Global Laplacian variance (today) | Misses focus falloff; depends on content density |
+| Global Laplacian variance (before) | Misses focus falloff; depends on content density |
+| Tile ratio without pre-smoothing | Measured noise instead of blur on grainy photos |
 | Tenengrad / Brenner per tile | Good alternatives; they depend on contrast unless normalized the same way |
-| Edge width (Marziliano) | Gives physical units (px of blur), but is harder to make robust on handwriting |
-| FFT high-frequency ratio | Costs more per tile for a similar signal |
+| Edge width (Marziliano) | Gives physical units, but is harder to make robust on handwriting |
 
 ---
 
-## 2. Lighting: shadows
+## 2. Shadows
 
-**Today in code:** the standard deviation of mean brightness across an 8 × 8 grid (45 → 0,
-4 → 100). This responds to layout as well as light: a clean page scores about 75.
+Module: [`shadows.py`](../src/scan_quality/scoring/shadows.py). Replaces the 8 × 8 cell-brightness
+spread, which also responded to layout: a clean page scored about 75.
 
-### Recommended formula
+### Formula
 
-Measure the light falling on the **paper only**, after removing the ink:
-
-1. Estimate the background $B$: apply a morphological closing to grayscale $D$ with a 15 × 15
-   kernel (about 2 mm, wider than any pen stroke), which removes the ink. Then smooth with a
-   51 × 51 median blur.
-2. The raw value is the **shading ratio** between the darkest and brightest parts of the paper:
+1. Estimate the paper background $B$ of grayscale $D$, with the ink removed (see Shared
+   conventions).
+2. The raw value is the **shading ratio**:
 
 $$
 S = \frac{p_{5}(B)}{p_{95}(B)}
 $$
 
-3. Score it with a linear ramp, using illustrative anchors **0.40 → 0** and **0.80 → 100**.
+3. Score it with a linear ramp: **0.40 → 0** and **0.80 → 100**.
 
 ### Interpretation
 
-- $S$ is the share of the brightest region's light that the darkest region receives. With
-  $S = 0.5$, the shadowed part of the page is half as bright as the lit part.
-- A ratio doesn't depend on exposure: a dim room with even light isn't penalized.
-- The anchors are **lenient** on purpose. A soft gradient is easy to correct downstream by dividing
-  by the background (flat-field correction). The real harm of a deep shadow is lost ink contrast,
-  and the [Contrast](#4-contrast) check measures that directly in the worst region. This check
-  exists mainly to give the user a clear message.
-- **Caveat:** cheques with large colored security backgrounds can read as shading. Calibrate on
-  your real cheque stock.
+- $S$ is the share of the brightest region's light that the darkest region receives.
+- A ratio doesn't depend on exposure: a dim room with even light scores 100.
+- The anchors are **lenient** on purpose. A soft gradient can be divided out downstream. A deep
+  shadow costs ink contrast, and the contrast check measures that directly. This check mainly
+  tells the user *why*.
+- The median keeps a hard shadow edge sharp. A blurred edge would leave a band of mis-corrected
+  paper, and the contrast check would read it as faint ink.
+- **Caveat:** large colored security backgrounds on cheques, and black logo blocks, read as
+  shading. Calibrate on your real document stock.
+
+### Measured on synthetic pages
+
+| Page | $S$ | Score |
+|---|---|---|
+| Even light | 0.996 | 100 |
+| Lower half at 75 % light | 0.751 | 87.8 |
+| Side light losing 55 % | 0.496 | 24.0, rejected |
+| Lower half at 45 % light | 0.458 | 14.5, rejected |
 
 ### Example
 
-A user photographs an accident report on a car seat. Their arm casts a hard shadow across the lower
-half. The background measures 230 in the lit part and 110 in the shadow:
+An accident report photographed on a car seat, with the user's arm shadowing the lower half. The
+paper measures 230 in the light and 110 in the shadow:
 
 $$
 S = \frac{110}{230} = 0.478 \qquad \text{score} = 100 \cdot \frac{0.478 - 0.40}{0.40} = 19.6 \;\rightarrow\; \texttt{poor}
 $$
 
-The capture is rejected with *"Move to even light; avoid casting a shadow"*. A soft window gradient
-($S = 0.75$) would score 87.5 and pass.
+The capture is rejected with *"Move to even light and avoid casting a shadow on the document."*
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| Cell-mean standard deviation (today) | Responds to text density, not just to light |
+| Cell-mean standard deviation (before) | Responds to text density, not just to light |
 | Background standard deviation | Depends on exposure; harder to read than a ratio |
 | Fitted brightness plane | Only catches linear gradients, not a hard shadow edge |
 
 ---
 
-## 3. Glare (new, split from lighting)
+## 3. Glare
 
-**Today in code:** not measured. The lighting check averages a glare spot into one grid cell.
+Module: [`glare.py`](../src/scan_quality/scoring/glare.py). New: the old lighting check averaged a
+glare spot into one grid cell.
 
-### Recommended formula
+### Formula
 
-Glare is the most common capture failure for **glossy and laminated documents** and for photos
-taken under ceiling lights. Unlike a shadow, it **destroys the information underneath**, so it gets
-its own strict check:
+Glare destroys the information underneath it and can't be corrected afterwards, so this check is
+strict:
 
-1. On the color image $D$, mark a pixel as specular when **all three channels are near
-   saturation**: $\min(R, G, B) \ge 250$.
-2. Apply a morphological opening to drop isolated pixels, and keep connected blobs of at least
-   20 px.
-3. The raw value is the **area of the largest blob** as a share of the document's area:
+1. A pixel is **saturated** when $\min(R, G, B) \ge 250$. Apply a 3 × 3 opening and keep blobs of
+   at least 20 px.
+2. The raw value is the **largest blob** as a share of the document's area:
 
 $$
 G = \frac{\max_k \lvert \text{blob}_k \rvert}{\lvert D \rvert}
 $$
 
-4. Score it with a reversed linear ramp, using illustrative anchors **1.0 % → 0** and
-   **0.05 % → 100**.
-
-We use the largest blob rather than the total because one solid blob hides a word, while scattered
-specks hide nothing.
+3. Score it with a reversed linear ramp: **1.0 % → 0** and **0.05 % → 100**.
 
 ### Interpretation
 
-- At 8 px/mm, 1 % of a cheque (1400 × 640 px) is about 9 000 px, or roughly 12 × 12 mm. That is
-  enough to hide the amount in figures.
-- Strongly overexposed paper also saturates and counts as glare. That is intended, because
-  overexposure wipes out faint ink the same way.
-- **Zone rule (cheques):** a glare blob that overlaps a required zone (the amount in figures, the
-  amount in words, the MICR/CMC7 line or the signature) rejects the capture whatever the score.
+- We use the largest blob, not the total: one solid spot hides a word, while scattered specks hide
+  nothing.
+- At 8 px/mm, 1 % of a cheque is about 12 × 12 mm, enough to hide the amount in figures. 0.05 % is
+  about 2.5 × 2.5 mm, smaller than one handwritten digit.
+- Strongly overexposed paper also saturates and counts as glare. That is intended, but see the
+  risk under [Calibration](#calibration).
+- **Not implemented yet: zone rule for cheques.** This rule would reject any glare over the amount,
+  the CMC7 line or the signature, regardless of size. It needs the zone coordinates of the cheque
+  layouts we accept.
 
 ### Example
 
-A user photographs a laminated insurance card under an office light. A reflection of
-100 × 60 px appears on a document of 1400 × 640 px:
+A laminated card photographed under an office light, with a 100 × 60 px reflection on a
+1400 × 640 px document:
 
 $$
 G = \frac{6\,000}{896\,000} = 0.670\,\% \qquad \text{score} = 100 \cdot \frac{1.0 - 0.670}{1.0 - 0.05} = 34.8 \;\rightarrow\; \texttt{poor}
 $$
 
-The capture is rejected with *"Tilt the phone slightly to remove the reflection"*.
+The capture is rejected with *"Tilt the phone slightly to remove the reflection."*
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| Total saturated area | Penalizes harmless scattered specks as much as one blob hiding a word |
-| HSV rule (high V, low S) | Similar result; the min-channel rule is simpler and doesn't need a color-space conversion |
-| Glare detection model | More robust on holograms, but needs training data; worth revisiting later |
+| Total saturated area | Penalizes harmless specks as much as one blob hiding a word |
+| HSV rule (high V, low S) | Similar result; the min-channel rule is simpler |
+| Glare detection model | More robust on holograms, but needs training data |
 
 ---
 
 ## 4. Contrast
 
-**Today in code:** RMS contrast over the whole frame (12 → 0, 65 → 100). This penalizes sparse
-documents such as cheques, which are mostly blank paper.
+Module: [`contrast.py`](../src/scan_quality/scoring/contrast.py). Replaces RMS contrast, which
+penalized cheques for being mostly blank paper.
 
-### Recommended formula
+### Formula
 
-Measure **how well ink separates from paper**, independently of how much ink there is:
-
-1. Convert $D$ to a **min-channel** image $M = \min(R, G, B)$. Blue ballpoint ink, which is common
-   on cheques and handwritten claim forms, is faint in ordinary grayscale but dark in the red
-   channel. Red stamps are dark in green and blue. The minimum keeps all inks dark and white paper
-   bright.
-2. Flat-field correct it, $F = 255 \cdot M / B_M$, where $B_M$ is the background of $M$ estimated
-   as in the shadows check. This removes the shadows so they aren't counted twice.
-3. Split pixels into ink $i$ and paper $p$ with the adaptive threshold mask.
-4. On a 4 × 4 grid over the document, in each cell with at least 200 ink pixels, compute the
-   **separability** $d'$:
+1. **Min-channel image** $M = \min(R, G, B)$. Paper is bright in every channel, but every colored
+   ink is dark in at least one. A pale red stamp keeps its real contrast instead of fading into
+   the paper as it does in luminance.
+2. **Flat-field correction** $F = 255 \cdot M / B_M$, where $B_M$ is the background of $M$. This
+   removes shadows so they aren't counted twice. The noise they amplify still counts.
+3. Split $F$ into ink $i$ and paper $p$ with the ink mask, on a **4 × 4 grid**. A cell is measured
+   when it has at least 200 ink pixels and 200 paper pixels. In each cell, compute two values from
+   the paper noise $\sigma_p = \max(1.4826 \cdot \mathrm{MAD}(p),\ 2)$:
 
 $$
-d' = \frac{\mu_p - \mu_i}{\sqrt{\tfrac{1}{2}\left(\sigma_p^2 + \sigma_i^2\right)}}
+\text{separation} = \frac{\operatorname{med}(p) - \operatorname{med}(i)}{\sigma_p}
+\qquad
+\text{depth} = \frac{\operatorname{med}(p) - \operatorname{med}(i)}{\operatorname{med}(p)}
 $$
 
-5. The raw value is the **minimum $d'$ across cells**, i.e. the region where ink is hardest to
-   tell from paper. Score it with a linear ramp, using illustrative anchors **2 → 0** and
-   **6 → 100**.
+4. Take the **worst cell** for each value, score each with a linear ramp (separation **2 → 0**,
+   **6 → 100**; depth **0.08 → 0**, **0.25 → 100**), and keep the **lower** of the two scores.
+   The raw value is the worst separation; the worst depth is in `details`.
+
+No measurable ink scores **0**.
 
 ### Interpretation
 
-- $d'$ asks *"how many noise widths apart are ink and paper?"*. Around 2, a threshold misclassifies
-  many pixels and strokes break up. Above about 6, binarization is clean.
-- It uses only the two groups' statistics, not their sizes. A cheque with a few lines of ink scores
-  the same as a dense page with the same ink quality, which fixes the sparse-document problem.
-- Taking the minimum across cells means the check catches a deep shadow, a faded corner or a
-  sensor-noise region (low light), wherever it is.
+- **Separation** asks *"how many noise widths apart are ink and paper?"*. At 2σ, a threshold
+  misclassifies about 16 % of pixels and strokes break up. Past 6σ, binarization is clean.
+- **Depth** is Weber contrast: how much darker the ink is than the paper. It is needed because a
+  very faint ink on a clean photo can be statistically separable and still be lost to the phone's
+  JPEG compression or the downstream binarizer. On the synthetic pages, rectification averaged
+  away enough grain that an 11-level gap passed on separation alone.
+- **Why the paper's noise and not a pooled ink-and-paper deviation (d′):** the ink class is
+  dominated by anti-aliased stroke edges. Their spread grows with contrast itself, so a pooled
+  ratio barely moved when the page was washed out.
+- Medians and MAD make the statistics robust to the odd pixel the mask gets wrong. The worst cell
+  catches a faded corner or a noisy shadowed strip wherever it is.
+- Only ink and paper levels are used, not how much ink there is, so a cheque with a few lines
+  scores the same as a dense page.
 
 ### Example
 
-The handwritten amount on a cheque, in blue ballpoint. The paper averages 230 (σ = 8):
+A pale red "VU" stamp, in RGB (235, 190, 190), on paper at 230 with noise σ = 8:
 
-| Channel | Ink μ (σ = 20) | $d'$ | Score |
-|---|---|---|---|
-| Ordinary grayscale | 170 | $60 / 15.23 = 3.94$ | 48.5, `poor` |
-| Min-channel (recommended) | 90 | $140 / 15.23 = 9.19$ | 100, `excellent` |
+| Channel | Ink level | Separation | Depth | Score |
+|---|---|---|---|---|
+| Luminance | 203.5 | 26.5 / 8 = 3.31 → 32.8 | 0.115 → 20.7 | **20.7, rejected** |
+| Min-channel (used) | 190 | 40 / 8 = 5.0 → 75.0 | 0.174 → 55.2 | **55.2, accepted** |
 
-The ink is perfectly legible. Ordinary grayscale would have rejected a good cheque because of the
-pen color, not the photo. The same cheque under the current RMS formula measures low as well, just
-because it is mostly blank paper.
+The stamp can be read. In luminance, the capture would have been rejected because of the ink's
+color, not because of the photo.
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| RMS contrast (today) | Depends on ink coverage; penalizes cheques |
-| Ink–paper mean difference $\mu_p - \mu_i$ | Ignores noise: a dark but grainy low-light photo would pass |
-| Michelson / Weber on percentiles | Also depend on coverage through the percentiles |
+| RMS contrast (before) | Depends on ink coverage; penalizes cheques |
+| Pooled d′ | Hardly reacts to washing out (see above) |
+| Separation alone | Accepted near-invisible ink on low-noise photos |
+| Depth alone | Accepts a dark but very grainy low-light photo |
 
 ---
 
-## 5. Framing and resolution (replaces skew)
+## 5. Framing and resolution
 
-**Today in code:** the text-line angle from a Hough transform on baseline points (5° → 0,
-0.5° → 100).
+Module: [`framing.py`](../src/scan_quality/scoring/framing.py). Replaces the skew angle.
 
-### Why skew is no longer scored
+### Formula
 
-Rotation is **fully recoverable**. Step 0 rectifies the document, and the downstream OCR deskews
-whatever is left. Penalizing it would reject captures that extract perfectly. The angle is still
-reported for information and for 90°/180° orientation handling downstream.
-
-What a phone capture *can* get wrong for good is **framing**: part of the document is outside the
-photo, or the document is too far away to have enough pixels.
-
-### Recommended formula
-
-1. **In frame (gate).** All four detected corners must be at least 1 % of the frame size away from
-   the frame edge. If they aren't, the score is **0**, with the message *"Fit the whole document in
-   the frame"*.
-2. **Effective resolution.** For each side $k$ of the detected quad in the *original* photo, divide
-   its length in pixels by its physical length in mm. The raw value is the **worst side**:
+1. **Found.** No document detected → score **0**.
+2. **In frame.** Any corner closer than 1 % of the frame size to the frame edge → score **0**, with
+   the message *"Fit the whole document inside the frame."* This rule doesn't apply to PDF renders.
+3. **Resolution.** For each side of the detected quad in the original photo, divide its length in
+   pixels by its physical length in mm. Keep the **worst side**:
 
 $$
 \rho = \min_k \frac{\text{length}_k\ (\text{px})}{\text{length}_k\ (\text{mm})}
+\qquad
+\text{score} = \text{linear}(\rho;\ 4,\ 8)
 $$
 
-3. Score $\rho$ with a linear ramp: **4 px/mm (≈ 100 DPI) → 0** and **8 px/mm (≈ 200 DPI) → 100**.
+   **4 px/mm (≈ 100 DPI) → 0** and **8 px/mm (≈ 200 DPI) → 100**. Below the threshold, the message
+   is *"Move closer to the document."*
 
-$$
-\text{score} =
-\begin{cases}
-0 & \text{if a corner is out of frame} \\
-\text{linear}(\rho;\ 4,\ 8) & \text{otherwise}
-\end{cases}
-$$
+The rotation of the top edge is reported in `details.rotation_deg` but isn't scored. A 90° or 180°
+turned page isn't detected and is left to the downstream pipeline.
 
 ### Interpretation
 
-- $\rho$ is the resolution of the worst-captured part of the document. It is an upper bound on the
-  detail available there, whatever the downstream processing.
-- Perspective isn't penalized separately. It matters only through what it costs: fewer pixels on
-  the far side, which $\rho$ catches by taking the minimum side, and focus falloff, which the
-  sharpness check catches.
-- 8 px/mm is enough for printed text and handwriting. Raise the 100 anchor if downstream extraction
-  needs to read small print, such as policy terms.
+- $\rho$ is the resolution of the worst-captured part of the document, an upper bound on the detail
+  available there.
+- Perspective is penalized only through what it costs: fewer pixels on the far side (the minimum
+  side) and focus falloff (sharpness).
+- Raise the 100 anchor if extraction must read small print, such as policy terms.
 
 ### Example
 
-A user photographs a cheque from too far away with a 4000 × 3000 phone camera. The far (top) edge
-of the cheque spans 1 100 px over 175 mm:
+A cheque photographed from too far away. The far edge spans 1 100 px over 175 mm:
 
 $$
 \rho = \frac{1\,100}{175} = 6.29\ \text{px/mm} \qquad \text{score} = 100 \cdot \frac{6.29 - 4}{4} = 57.1 \;\rightarrow\; \texttt{fair}
 $$
 
-The capture is accepted, but the app can show *"Move closer"*. If the user had cropped off the
-signature corner, the capture would score 0 and be rejected, however sharp it was.
+The capture is accepted. If the user had cropped off the signature corner, it would score 0 and be
+rejected, however sharp it was.
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| Skew angle (today) | Recoverable downstream; penalizing it rejects good captures |
+| Skew angle (before) | Recoverable downstream; penalizing it rejects good captures |
 | Separate perspective ratio | Duplicates what $\rho$ and sharpness already measure |
-| Total megapixels of the photo | Says nothing about how much of the photo is the document |
+| Total megapixels | Says nothing about how much of the photo is the document |
 
 ---
 
-## Accept or reject decision (replaces the overall mean)
+## Accept or reject decision
 
-**Today in code:** an unweighted mean of the five scores, labeled with the same thresholds.
+Module: [`pipeline.py`](../src/scan_quality/scoring/pipeline.py). Replaces the unweighted mean.
 
-### Recommended formula
-
-Use a **weakest-link gate** with one threshold per check:
+### Formula
 
 $$
 \text{accept} \iff s_i \ge \tau_i \quad \text{for every check } i
@@ -413,71 +438,78 @@ $$
 \text{overall} = \min_i\, s_i
 $$
 
-- $\tau_i$ defaults to 50 and is tuned per check (see [Calibration](#calibration)).
-- The **lowest-scoring check** decides the retake message shown to the user.
-- **Retry budget:** after 3 rejected attempts, accept the best capture so far and flag it for manual
-  review. A user filing an accident claim must never get stuck in a loop.
+- $\tau_i$ defaults to 50 for every check (`ACCEPT_THRESHOLDS`).
+- The response lists `failed_checks` worst first. The worst one's message becomes `retake_message`.
+- **Retry budget (app side):** after 3 rejected attempts, the app accepts the best capture so far
+  and flags it for manual review. The API is stateless, so the app counts the attempts and keeps
+  the best capture.
 
 ### Interpretation
 
-The mean answers *"how good is this photo on average?"*. For a gate, the question is *"is anything
-in this photo bad enough to break extraction?"*, and only the minimum answers that.
+The mean answers *"how good is this photo on average?"*. A gate must answer *"is anything bad enough
+to break extraction?"*, and only the minimum does that.
 
 ### Example
 
-A claim form photographed on a desk with a ceiling light above:
+A claim form photographed under a ceiling light:
 
 | Check | Score |
 |---|---|
+| Framing and resolution | 85.00 |
 | Sharpness | 88.00 |
 | Shadows | 82.00 |
 | Glare | **34.78** |
 | Contrast | 90.00 |
-| Framing and resolution | 85.00 |
-| **Mean (today)** | **75.96, `good`: accepted** |
-| **Minimum (recommended)** | **34.78, `poor`: rejected, "Tilt to remove the reflection"** |
-
-Under the mean, this form goes downstream with a field hidden under the reflection. Under the gate,
-the user retakes it in two seconds.
+| Mean (before) | 75.96, `good`: accepted |
+| **Minimum (now)** | **34.78, `poor`: rejected, "Tilt the phone slightly to remove the reflection."** |
 
 ### Alternatives considered
 
 | Alternative | Why not chosen |
 |---|---|
-| Unweighted mean (today) | Averages away a single fatal defect |
+| Unweighted mean (before) | Averages away a single fatal defect |
 | Weighted mean | Same problem, with weights that are harder to justify |
-| Geometric or power mean | Softer than the minimum, but the user still can't tell which defect caused a rejection |
-| Learned classifier | A good next step once we have labeled captures; the gate stays the explainable fallback |
+| Geometric or power mean | Softer than the minimum, and doesn't say which defect caused a rejection |
+| Learned classifier | A good next step once we have labeled captures |
 
 ---
 
 ## Calibration
 
-The anchors above are illustrative. Before release:
+All anchors were set against synthetic captures from [`tests/fixtures.py`](../tests/fixtures.py):
+rendered text with controlled blur, shadows, glare, washing out and sensor noise. Real phones add
+demosaicing, sharpening, denoising and JPEG compression, which will move the raw values. Before
+release:
 
-1. Collect real captures from the target channels (phone app, kiosk) and document types (cheques,
-   constats, claim forms, invoices).
-2. Label each one by its **downstream outcome**: extraction succeeded, or needed correction or
-   manual review.
-3. For each check, plot the score against the outcome. Pick $\tau_i$ so the **false-accept rate**
-   stays under the business target (e.g. ≤ 2 %), then check how many retakes that causes.
+1. Collect real captures from the target channels and document types (cheques, constats, claim
+   forms, invoices).
+2. Label each one by its **downstream outcome**: extracted fine, or needed correction or manual
+   review.
+3. For each check, read the `raw_value`s and pick $\tau_i$ and the anchors so the **false-accept
+   rate** stays under the business target (e.g. ≤ 2 %). Then check how many retakes that causes.
 4. False accepts are the costly error: a manual review, a delayed claim, a returned cheque. False
-   rejects cost a few seconds of retaking. Set thresholds with that asymmetry in mind.
+   rejects cost a few seconds of retaking.
+
+Risks to check first on real photos:
+- **Glare vs. auto-exposure.** A white page on a dark table can make the phone overexpose until the
+  paper clips at 255. The glare check would then see one huge blob. If that is common, require a
+  blob to be brighter than the paper around it.
+- **Detection on busy surfaces.** Wood grain, patterned seats and a hand holding the page can merge
+  with the paper region. A lightweight edge or corner model may be needed.
+- **Sharpness anchors.** Phone sharpening raises $r_t$. The 0.10 ceiling may need to move up.
 
 ---
 
 ## Summary
 
-| Check | Catches | Recoverable downstream? | Raw value | Retake message |
-|---|---|---|---|---|
-| Sharpness | Hand shake, focus falloff | No | $p_{10}$ of tile $r_t$ | "Hold still / hold parallel" |
-| Shadows | Shadows from the user's hand or phone | Partly | $p_5(B)/p_{95}(B)$ | "Move to even light" |
-| Glare | Reflections, overexposure | No | Largest saturated blob, % of area | "Tilt to remove the reflection" |
-| Contrast | Faint ink, low-light noise | No | Min cell $d'$ (min-channel) | "Find more light" |
-| Framing and resolution | Cut-off edges, document too far away | No | In-frame gate, worst-side px/mm | "Fit the whole document / move closer" |
-| ~~OCR confidence~~ | Removed: handled by the downstream OCR | — | — | — |
-| ~~Skew~~ | Removed: fixed by rectification and downstream deskew | Yes | Reported only | — |
+| Check | Catches | Raw value | Retake message |
+|---|---|---|---|
+| Framing and resolution | Missing, cut-off or too-distant document | Worst-side px/mm | "Fit the whole document…" / "Move closer…" |
+| Sharpness | Hand shake, focus falloff | $p_{10}$ of tile $r_t$ | "Hold the phone still and parallel…" |
+| Shadows | Shadows from the user's hand or phone | $p_5(B)/p_{95}(B)$ | "Move to even light…" |
+| Glare | Reflections, overexposure | Largest saturated blob, % of area | "Tilt the phone slightly…" |
+| Contrast | Faint ink, low-light noise | Worst-cell separation (+ depth) | "Find more light…" |
 
-**Open question:** the checks run today in Python/OpenCV on a server. Running them on the phone,
-including on live preview frames, means porting them to the mobile OpenCV SDK or to native code,
-and measuring the time budget on low-end devices.
+**Performance:** about 0.5 s per A4 photo (2 000 × 2 850 px) on a laptop CPU; a PDF page takes about
+0.35 s. Running on the phone, including on live preview frames, means porting to the mobile OpenCV
+SDK or native code and measuring on low-end devices.
