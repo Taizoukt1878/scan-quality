@@ -1,16 +1,16 @@
-"""FastAPI application exposing the scan-quality scorer.
+"""FastAPI application exposing the capture-quality gate.
 
 Endpoints:
-    POST /score    multipart upload of a JPEG, PNG or PDF -> scoring breakdown
-    GET  /health   liveness plus external-binary status
+    POST /score    multipart upload of a JPEG, PNG or PDF -> accept/reject + breakdown
+    GET  /health   liveness
 
 This module owns HTTP concerns only: reading the upload, enforcing limits,
 mapping domain exceptions onto status codes. All image logic lives in
 :mod:`scan_quality.scoring`.
 """
 
-import re
 import time
+from typing import Literal
 
 from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,12 +25,7 @@ from scan_quality.loaders import (
     UnsupportedFileTypeError,
     load_page_image,
 )
-from scan_quality.scoring.ocr import (
-    DEFAULT_LANG,
-    OcrLanguageError,
-    OcrUnavailableError,
-    is_tesseract_available,
-)
+from scan_quality.scoring.document import DEFAULT_DOCUMENT_TYPE
 from scan_quality.scoring.pipeline import score_image
 
 # --- Request limits ---------------------------------------------------------
@@ -45,17 +40,18 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 # whole body is in memory, rather than after.
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
-# Tesseract language codes: three lowercase letters, optionally combined with
-# "+" (e.g. "fra+eng"). Validated because this value reaches a subprocess
-# argument list.
-LANG_PATTERN = re.compile(r"^[a-z]{3}(\+[a-z]{3})*$")
+# Document types the caller can declare. Must match the keys of
+# scoring.document.DOCUMENT_SIZES_MM; the physical size is what the framing
+# check measures resolution against.
+DocumentType = Literal["a4", "cheque"]
 
 app = FastAPI(
     title="Scan Quality API",
     version=__version__,
     description=(
-        "Scores the scan quality of a document image (cheques, certificates, "
-        "devis/quotes) using five independent, locally-run checks."
+        "Decides whether a photo of a document (cheque, claim form, accident "
+        "report) is good enough to send to extraction, and if not, what the "
+        "user should do differently."
     ),
 )
 
@@ -103,61 +99,36 @@ async def _read_upload(upload: UploadFile) -> bytes:
     summary="Liveness check",
 )
 def health() -> HealthResponse:
-    """Report that the service is up, and whether Tesseract can be reached.
-
-    ``tesseract_available: false`` means ``/score`` will return 503 for every
-    request, so this is worth alerting on.
-    """
-    available = is_tesseract_available()
-    version: str | None = None
-    if available:
-        import pytesseract
-
-        version = str(pytesseract.get_tesseract_version())
-    return HealthResponse(
-        status="ok",
-        version=__version__,
-        tesseract_available=available,
-        tesseract_version=version,
-    )
+    """Report that the service is up."""
+    return HealthResponse(status="ok", version=__version__)
 
 
 @app.post(
     "/score",
     response_model=ScoreResponse,
-    summary="Score the scan quality of an uploaded document",
+    summary="Decide whether a document capture is good enough to accept",
     responses={
-        400: {
-            "model": ErrorResponse,
-            "description": "Empty/undecodable file, or a bad or uninstalled language",
-        },
+        400: {"model": ErrorResponse, "description": "Empty or undecodable file"},
         413: {"model": ErrorResponse, "description": "File exceeds the size limit"},
         415: {"model": ErrorResponse, "description": "Not a JPEG, PNG or PDF"},
-        503: {"model": ErrorResponse, "description": "Tesseract or poppler unavailable"},
+        503: {"model": ErrorResponse, "description": "poppler unavailable (PDF uploads)"},
     },
 )
 async def score(
     request: Request,
-    file: UploadFile = File(description="Document image: JPEG, PNG or PDF (first page is scored)."),
-    lang: str = Query(
-        default=DEFAULT_LANG,
-        description='Tesseract language pack(s), e.g. "fra" or "fra+eng". Must be installed.',
+    file: UploadFile = File(description="Document photo: JPEG, PNG or PDF (first page is scored)."),
+    doc_type: DocumentType = Query(
+        default=DEFAULT_DOCUMENT_TYPE,
+        description="What was photographed; its physical size sets the resolution target.",
     ),
 ) -> ScoreResponse | JSONResponse:
-    """Run the five quality checks over one uploaded page.
+    """Locate the document, run every check, and return the accept/reject decision.
 
     File type is determined from the file's own magic bytes, not from its
-    extension or declared content type.
+    extension or declared content type. A PDF page is a render, not a photo,
+    so it is scored as the whole document without detection.
     """
     started = time.perf_counter()
-
-    if not LANG_PATTERN.match(lang):
-        return _error(
-            400,
-            "invalid_language",
-            f'Invalid language code "{lang}". Expected three lowercase letters, '
-            'optionally joined with "+", e.g. "fra" or "fra+eng".',
-        )
 
     try:
         data = await _read_upload(file)
@@ -175,15 +146,9 @@ async def score(
         return _error(503, "pdf_render_unavailable", str(exc))
 
     # Scoring is CPU-bound and synchronous; off the event loop it goes, so one
-    # slow OCR pass cannot stall every other in-flight request.
-    try:
-        report = await run_in_threadpool(score_image, image, lang)
-    except OcrLanguageError as exc:
-        # The caller asked for a pack this server does not have. Their problem
-        # to fix (or the operator's), so 400 rather than 503.
-        return _error(400, "language_not_available", str(exc))
-    except OcrUnavailableError as exc:
-        return _error(503, "ocr_unavailable", str(exc))
+    # large photo cannot stall every other in-flight request.
+    whole_frame = file_meta["source_format"] == "pdf"
+    report = await run_in_threadpool(score_image, image, doc_type, whole_frame)
 
     file_meta = {"filename": file.filename, "size_bytes": len(data), **file_meta}
     total_ms = (time.perf_counter() - started) * 1000.0
