@@ -1,4 +1,4 @@
-"""Pure image-quality checks. No FastAPI, no I/O — arrays in, scores out."""
+"""Pure capture-quality checks. No FastAPI, no I/O — arrays in, scores out."""
 
 from scan_quality.scoring.base import CheckResult, label_for
 
