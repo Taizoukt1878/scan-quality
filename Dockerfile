@@ -5,14 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 # System packages:
-#   tesseract-ocr      - the OCR engine behind check 5
-#   tesseract-ocr-fra  - French language pack (documents in scope are largely
-#                        French); drop it if you only ever score English
 #   poppler-utils      - pdftoppm/pdfinfo, which pdf2image shells out to
 #   libgl1, libglib2.0-0 - shared libraries opencv-python links against
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        tesseract-ocr \
-        tesseract-ocr-fra \
         poppler-utils \
         libgl1 \
         libglib2.0-0 \
