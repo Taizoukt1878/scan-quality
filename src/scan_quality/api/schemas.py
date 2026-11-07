@@ -12,7 +12,7 @@ from scan_quality.scoring.pipeline import QualityReport
 
 
 class CheckScore(BaseModel):
-    """One of the five quality checks."""
+    """One capture-quality check."""
 
     name: str = Field(description="Machine-readable check identifier.")
     score: float = Field(ge=0, le=100, description="Normalized quality, 0-100, higher is better.")
@@ -23,6 +23,9 @@ class CheckScore(BaseModel):
     raw_metric: str = Field(description="Name and unit of raw_value.")
     details: dict[str, Any] = Field(
         default_factory=dict, description="Check-specific diagnostics. Not used in scoring."
+    )
+    retake_message: str | None = Field(
+        default=None, description="Instruction shown to the user if this check rejects the capture."
     )
 
 
@@ -37,18 +40,30 @@ class FileMeta(BaseModel):
     width: int
     height: int
     render_dpi: int | None = Field(default=None, description="Rasterization DPI, PDFs only.")
+    doc_type: str = Field(description="Declared document type: a4 | cheque.")
+    document_width: int | None = Field(
+        default=None, description="Width of the rectified document in px; null if not found."
+    )
+    document_height: int | None = Field(
+        default=None, description="Height of the rectified document in px; null if not found."
+    )
 
 
 class ScoreResponse(BaseModel):
-    """Full scoring result for one uploaded document."""
+    """Accept/reject decision and full breakdown for one uploaded capture."""
 
-    overall_score: float = Field(
-        ge=0, le=100, description="Unweighted mean of the five check scores."
-    )
+    accepted: bool = Field(description="True when every check reached its threshold.")
+    overall_score: float = Field(ge=0, le=100, description="The lowest check score.")
     overall_label: str
-    checks: list[CheckScore]
+    failed_checks: list[str] = Field(description="Checks below their threshold, worst first.")
+    retake_message: str | None = Field(
+        description="What the user should do differently; null when accepted."
+    )
+    checks: list[CheckScore] = Field(
+        description="Per-check results. Only framing when no document was found."
+    )
     processing_time_ms: float = Field(
-        description="Total server-side time: decode plus all five checks."
+        description="Total server-side time: decode, detection and every check."
     )
     file: FileMeta
 
@@ -62,8 +77,11 @@ class ScoreResponse(BaseModel):
         well as scoring, so it is always at least the report's own timing.
         """
         return cls(
+            accepted=report.accepted,
             overall_score=report.overall_score,
             overall_label=report.overall_label,
+            failed_checks=report.failed_checks,
+            retake_message=report.retake_message,
             checks=[CheckScore(**vars(check)) for check in report.checks],
             processing_time_ms=round(total_ms, 2),
             file=FileMeta(**file_meta, **report.meta),
@@ -71,14 +89,10 @@ class ScoreResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Liveness plus the status of the two external binaries."""
+    """Liveness."""
 
     status: str
     version: str
-    tesseract_available: bool = Field(
-        description="False means /score will fail: the OCR check cannot run."
-    )
-    tesseract_version: str | None = None
 
 
 class ErrorDetail(BaseModel):
